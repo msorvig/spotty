@@ -1,0 +1,17 @@
+[package]
+edition = "2018"
+name = "spotty"
+version = "0.1.0"
+
+[dependencies]
+futures = "*"
+itertools = "*"
+
+[dependencies.aws-sdk-ec2]
+git = "https://github.com/awslabs/aws-sdk-rust"
+package = "aws-sdk-ec2"
+tag = "v0.0.16-alpha"
+
+[dependencies.tokio]
+features = ["full"]
+version = "1"
