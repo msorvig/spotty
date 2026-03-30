@@ -1,0 +1,521 @@
+use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use std::process::Command;
+use std::time::Duration;
+use tabled::Tabled;
+
+use super::client::AwsClients;
+use super::instances::{self, LaunchConfig};
+use crate::config::Config;
+use crate::output;
+use crate::ssh;
+use crate::utils::{add_ssh_options, expand_tilde};
+
+#[derive(Debug, Serialize, Tabled)]
+pub struct AmiInfo {
+    #[tabled(rename = "AMI ID")]
+    pub ami_id: String,
+    #[tabled(rename = "Name")]
+    pub name: String,
+    #[tabled(rename = "Arch")]
+    pub arch: String,
+    #[tabled(rename = "Size")]
+    pub size: String,
+    #[tabled(rename = "Source")]
+    pub source: String,
+}
+
+/// Look up image sizes via describe_images. Returns a map of ami_id -> size string.
+async fn get_image_sizes(
+    clients: &AwsClients,
+    ami_ids: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut sizes = std::collections::HashMap::new();
+    if ami_ids.is_empty() {
+        return Ok(sizes);
+    }
+
+    let mut req = clients.ec2.describe_images();
+    for id in ami_ids {
+        req = req.image_ids(id);
+    }
+    let resp = req.send().await.context("Failed to describe images")?;
+
+    for image in resp.images() {
+        if let Some(id) = image.image_id() {
+            // Sum up all block device mapping sizes
+            let total_gb: i32 = image
+                .block_device_mappings()
+                .iter()
+                .filter_map(|bdm| bdm.ebs().and_then(|ebs| ebs.volume_size()))
+                .sum();
+            sizes.insert(id.to_string(), format!("{} GB", total_gb));
+        }
+    }
+
+    Ok(sizes)
+}
+
+/// List available AMIs: base AL2023 images from SSM + spotty-created + config AMIs.
+pub async fn list_images(region: Option<String>, json: bool) -> Result<()> {
+    let clients = AwsClients::new(region).await?;
+    let config = Config::load().unwrap_or_default();
+
+    let mut images: Vec<AmiInfo> = Vec::new();
+    let mut ami_ids_to_lookup: Vec<String> = Vec::new();
+
+    // Base AL2023 AMI variants to discover via SSM
+    let ssm_params: &[(&str, &str, &str)] = &[
+        (
+            "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+            "x86_64",
+            "AL2023",
+        ),
+        (
+            "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
+            "arm64",
+            "AL2023",
+        ),
+        (
+            "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64",
+            "x86_64",
+            "AL2023-minimal",
+        ),
+        (
+            "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-arm64",
+            "arm64",
+            "AL2023-minimal",
+        ),
+    ];
+
+    eprintln!("Fetching AMIs for {}...", clients.region);
+
+    let param_names: Vec<String> = ssm_params
+        .iter()
+        .map(|(name, _, _)| name.to_string())
+        .collect();
+    let resp = clients
+        .ssm
+        .get_parameters()
+        .set_names(Some(param_names))
+        .send()
+        .await
+        .context("Failed to fetch SSM parameters for base AMIs")?;
+
+    for param in resp.parameters() {
+        if let (Some(name), Some(value)) = (param.name(), param.value()) {
+            if let Some((_, arch, source)) = ssm_params.iter().find(|(n, _, _)| *n == name) {
+                ami_ids_to_lookup.push(value.to_string());
+                images.push(AmiInfo {
+                    ami_id: value.to_string(),
+                    name: name.rsplit('/').next().unwrap_or(name).to_string(),
+                    arch: arch.to_string(),
+                    size: String::new(),
+                    source: source.to_string(),
+                });
+            }
+        }
+    }
+
+    // Find spotty-created AMIs (tagged ManagedBy=spotty)
+    let owned_resp = clients
+        .ec2
+        .describe_images()
+        .owners("self")
+        .filters(
+            aws_sdk_ec2::types::Filter::builder()
+                .name("tag:ManagedBy")
+                .values("spotty")
+                .build(),
+        )
+        .send()
+        .await
+        .context("Failed to list spotty-created images")?;
+
+    for image in owned_resp.images() {
+        if let Some(id) = image.image_id() {
+            let name = image.name().unwrap_or("-").to_string();
+            let arch = image
+                .architecture()
+                .map(|a| a.as_str().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let total_gb: i32 = image
+                .block_device_mappings()
+                .iter()
+                .filter_map(|bdm| bdm.ebs().and_then(|ebs| ebs.volume_size()))
+                .sum();
+
+            images.push(AmiInfo {
+                ami_id: id.to_string(),
+                name,
+                arch,
+                size: format!("{} GB", total_gb),
+                source: "spotty".to_string(),
+            });
+        }
+    }
+
+    // Add custom AMIs from config
+    for (key, ami_id) in &config.ami {
+        // Skip if already listed as a spotty-created image
+        if images.iter().any(|i| i.ami_id == *ami_id) {
+            continue;
+        }
+
+        let arch = if key.ends_with("-arm64") {
+            "arm64"
+        } else if key.ends_with("-x86_64") {
+            "x86_64"
+        } else {
+            "unknown"
+        };
+
+        ami_ids_to_lookup.push(ami_id.clone());
+        images.push(AmiInfo {
+            ami_id: ami_id.clone(),
+            name: key.clone(),
+            arch: arch.to_string(),
+            size: String::new(),
+            source: "config".to_string(),
+        });
+    }
+
+    // Look up sizes for base + config AMIs
+    let sizes = get_image_sizes(&clients, &ami_ids_to_lookup).await?;
+    for image in &mut images {
+        if image.size.is_empty() {
+            if let Some(size) = sizes.get(&image.ami_id) {
+                image.size = size.clone();
+            }
+        }
+    }
+
+    if json {
+        output::print_json(&images)?;
+    } else {
+        output::print_table(&images);
+    }
+
+    Ok(())
+}
+
+/// Create an AMI from a running instance.
+pub async fn create_image(
+    instance_id: String,
+    name: Option<String>,
+    no_reboot: bool,
+    wait: bool,
+    region: Option<String>,
+) -> Result<()> {
+    let clients = AwsClients::new(region).await?;
+
+    // Verify instance exists and get its type
+    let resp = clients
+        .ec2
+        .describe_instances()
+        .instance_ids(&instance_id)
+        .send()
+        .await
+        .context("Failed to describe instance")?;
+
+    let instance = resp
+        .reservations()
+        .first()
+        .and_then(|r| r.instances().first())
+        .ok_or_else(|| anyhow::anyhow!("Instance {} not found", instance_id))?;
+
+    let instance_type = instance
+        .instance_type()
+        .map(|t| t.as_str().to_string())
+        .unwrap_or_default();
+
+    // Detect architecture from instance type
+    let instance_types = super::filters::get_instance_types(&clients).await?;
+    let arch = instance_types
+        .get(&instance_type)
+        .and_then(|spec| spec.architectures.first())
+        .cloned()
+        .unwrap_or_else(|| "x86_64".to_string());
+
+    // Generate AMI name if not provided
+    let ami_name = name.unwrap_or_else(|| {
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        format!("spotty-{}-{}-{}", instance_id, arch, timestamp)
+    });
+
+    eprintln!(
+        "Creating AMI '{}' from instance {} ({})...",
+        ami_name, instance_id, arch
+    );
+
+    let create_resp = clients
+        .ec2
+        .create_image()
+        .instance_id(&instance_id)
+        .name(&ami_name)
+        .no_reboot(no_reboot)
+        .tag_specifications(
+            aws_sdk_ec2::types::TagSpecification::builder()
+                .resource_type(aws_sdk_ec2::types::ResourceType::Image)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("ManagedBy")
+                        .value("spotty")
+                        .build(),
+                )
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Architecture")
+                        .value(&arch)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .context("Failed to create image")?;
+
+    let ami_id = create_resp
+        .image_id()
+        .ok_or_else(|| anyhow::anyhow!("No AMI ID returned"))?;
+
+    println!("{}", ami_id);
+
+    if wait {
+        eprintln!("Waiting for AMI to become available (this may take several minutes)...");
+        wait_for_image_available(&clients, ami_id).await?;
+        eprintln!("\nAMI is available.");
+    } else {
+        eprintln!("AMI creation started. It may take several minutes to become available.");
+    }
+
+    eprintln!(
+        "Hint: spotty config set ami.{}-{} {}",
+        clients.region, arch, ami_id
+    );
+
+    Ok(())
+}
+
+/// Deregister an AMI and delete its backing snapshots.
+pub async fn remove_image(ami_id: String, region: Option<String>) -> Result<()> {
+    let clients = AwsClients::new(region).await?;
+
+    // Get snapshot IDs before deregistering
+    let resp = clients
+        .ec2
+        .describe_images()
+        .image_ids(&ami_id)
+        .send()
+        .await
+        .context("Failed to describe image")?;
+
+    let image = resp
+        .images()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("AMI {} not found", ami_id))?;
+
+    let name = image.name().unwrap_or("-");
+    let snapshot_ids: Vec<String> = image
+        .block_device_mappings()
+        .iter()
+        .filter_map(|bdm| bdm.ebs().and_then(|ebs| ebs.snapshot_id()).map(String::from))
+        .collect();
+
+    eprintln!("Deregistering AMI {} ({})...", ami_id, name);
+    clients
+        .ec2
+        .deregister_image()
+        .image_id(&ami_id)
+        .send()
+        .await
+        .context("Failed to deregister image")?;
+
+    // Delete backing snapshots
+    for snap_id in &snapshot_ids {
+        eprintln!("Deleting snapshot {}...", snap_id);
+        if let Err(e) = clients
+            .ec2
+            .delete_snapshot()
+            .snapshot_id(snap_id)
+            .send()
+            .await
+        {
+            eprintln!("Warning: Failed to delete snapshot {}: {}", snap_id, e);
+        }
+    }
+
+    eprintln!("Done.");
+    Ok(())
+}
+
+/// Build an AMI by launching an instance, running a script, and baking the result.
+pub async fn build_image(
+    script: String,
+    name: Option<String>,
+    volume_size: Option<i32>,
+    region: Option<String>,
+    mut launch_config: LaunchConfig,
+) -> Result<()> {
+    // Verify script exists
+    let script_path = std::path::Path::new(&script);
+    if !script_path.exists() {
+        bail!("Script not found: {}", script);
+    }
+
+    // Default to 20 GB if not specified
+    if launch_config.volume_size.is_none() {
+        launch_config.volume_size = Some(volume_size.unwrap_or(20));
+    }
+    launch_config.region = region.clone();
+
+    // Step 1: Launch instance
+    eprintln!("Step 1/5: Launching builder instance...");
+    let instance_id = instances::start_instance_and_get_id(launch_config).await?;
+
+    // From here on, if anything fails, terminate the instance
+    match build_image_inner(&instance_id, &script, &name, &region).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("Build failed: {}. Terminating builder instance...", e);
+            let _ = instances::stop_instances(vec![instance_id], false, region).await;
+            Err(e)
+        }
+    }
+}
+
+async fn build_image_inner(
+    instance_id: &str,
+    script: &str,
+    name: &Option<String>,
+    region: &Option<String>,
+) -> Result<()> {
+    let clients = AwsClients::new(region.clone()).await?;
+    let config = Config::load().unwrap_or_default();
+
+    // Get IP and key
+    let ip = instances::get_instance_public_ip(&clients, instance_id).await?;
+    let key_name = instances::get_instance_key_name(&clients, instance_id).await?;
+    let key_path = if let Some(ref k) = config.defaults.key_path {
+        Some(expand_tilde(k).into_owned())
+    } else {
+        find_key_file(&key_name)
+    };
+
+    let user = config
+        .defaults
+        .ssh_user
+        .as_deref()
+        .unwrap_or("ec2-user");
+
+    // Step 2: Wait for SSH
+    eprintln!("Step 2/5: Waiting for SSH...");
+    ssh::wait_for_ssh(&ip, user, key_path.as_deref()).await?;
+    eprintln!(" ready.");
+
+    // Step 3: Upload and run script
+    eprintln!("Step 3/5: Uploading and running script...");
+    let target = format!("{}@{}:/tmp/spotty-build.sh", user, ip);
+
+    // SCP upload
+    let mut scp_cmd = Command::new("scp");
+    if let Some(ref kp) = key_path {
+        scp_cmd.arg("-i").arg(kp);
+    }
+    add_ssh_options(&mut scp_cmd);
+    scp_cmd.arg(script).arg(&target);
+
+    let scp_status = scp_cmd.status().context("Failed to run scp")?;
+    if !scp_status.success() {
+        bail!("SCP failed with status: {:?}", scp_status.code());
+    }
+
+    // SSH run script
+    let mut ssh_cmd = Command::new("ssh");
+    if let Some(ref kp) = key_path {
+        ssh_cmd.arg("-i").arg(kp);
+    }
+    add_ssh_options(&mut ssh_cmd);
+    ssh_cmd
+        .arg(format!("{}@{}", user, ip))
+        .arg("chmod +x /tmp/spotty-build.sh && /tmp/spotty-build.sh");
+
+    let ssh_status = ssh_cmd.status().context("Failed to run ssh")?;
+    if !ssh_status.success() {
+        bail!(
+            "Build script failed with exit code: {:?}",
+            ssh_status.code()
+        );
+    }
+
+    eprintln!("Script completed successfully.");
+
+    // Step 4: Bake AMI
+    eprintln!("Step 4/5: Creating AMI...");
+    create_image(
+        instance_id.to_string(),
+        name.clone(),
+        true,  // no_reboot
+        true,  // wait
+        region.clone(),
+    )
+    .await?;
+
+    // Step 5: Terminate builder instance
+    eprintln!("Step 5/5: Terminating builder instance...");
+    instances::stop_instances(vec![instance_id.to_string()], false, region.clone()).await?;
+
+    eprintln!("Image build complete.");
+    Ok(())
+}
+
+/// Find an SSH key file in ~/.ssh/ by key name.
+fn find_key_file(key_name: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let ssh_dir = std::path::PathBuf::from(&home).join(".ssh");
+    let candidates = [
+        ssh_dir.join(format!("{}.pem", key_name)),
+        ssh_dir.join(key_name),
+        ssh_dir.join(format!("{}.key", key_name)),
+    ];
+    for path in &candidates {
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Poll DescribeImages until the image is available.
+async fn wait_for_image_available(clients: &AwsClients, ami_id: &str) -> Result<()> {
+    loop {
+        let resp = clients
+            .ec2
+            .describe_images()
+            .image_ids(ami_id)
+            .send()
+            .await?;
+
+        let state = resp
+            .images()
+            .first()
+            .and_then(|img| img.state())
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+
+        match state {
+            "available" => return Ok(()),
+            "pending" => {
+                eprint!(".");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            "failed" | "error" | "deregistered" => {
+                bail!("AMI entered unexpected state: {}", state);
+            }
+            _ => {
+                eprint!(".");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
