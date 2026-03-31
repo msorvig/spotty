@@ -1,44 +1,30 @@
 use anyhow::Result;
-use aws_config::BehaviorVersion;
-use aws_sdk_ec2::Client as Ec2Client;
-use aws_sdk_ssm::Client as SsmClient;
+use aws_runtime_async::aws::Client;
 
 use crate::config::Config;
 
-#[allow(dead_code)]
 pub struct AwsClients {
-    pub ec2: Ec2Client,
-    pub ssm: SsmClient,
+    pub client: Client,
     pub region: String,
 }
 
 impl AwsClients {
-    pub async fn new(region: Option<String>) -> Result<Self> {
+    pub fn new(region: Option<String>) -> Result<Self> {
         let spotty_config = Config::load().unwrap_or_default();
 
-        // Use CLI region, then spotty config region, then let AWS SDK resolve
+        // Use CLI region, then spotty config region, then let aws-gen resolve
         let explicit_region = region.or(spotty_config.defaults.region.clone());
 
-        let aws_config = if let Some(ref r) = explicit_region {
-            aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(r.clone()))
-                .load()
-                .await
-        } else {
-            aws_config::load_defaults(BehaviorVersion::latest()).await
-        };
+        let mut client = Client::from_env();
 
-        let region_str = aws_config
-            .region()
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "us-east-1".to_string());
+        if let Some(ref r) = explicit_region {
+            client.creds.region = r.clone();
+        }
 
-        let ec2 = Ec2Client::new(&aws_config);
-        let ssm = SsmClient::new(&aws_config);
+        let region_str = client.creds.region.clone();
 
         Ok(Self {
-            ec2,
-            ssm,
+            client,
             region: region_str,
         })
     }

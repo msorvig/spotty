@@ -1,9 +1,5 @@
 use anyhow::{bail, Context, Result};
-use aws_sdk_ec2::error::ProvideErrorMetadata;
-use aws_sdk_ec2::types::{
-    Filter, InstanceMarketOptionsRequest, InstanceType, MarketType,
-    ResourceType, SpotMarketOptions, Tag, TagSpecification,
-};
+use aws_runtime_async::aws::error::AwsError;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -13,40 +9,37 @@ use tabled::Tabled;
 
 use super::client::AwsClients;
 use crate::config::Config;
+use crate::ec2;
 use crate::output;
 use crate::utils::base64_encode;
 
 // Common EC2 filter builders to reduce duplication
-fn filter_managed_by_spotty() -> Filter {
-    Filter::builder()
+fn filter_managed_by_spotty() -> ec2::Filter {
+    ec2::Filter::default()
         .name("tag:ManagedBy")
         .values("spotty")
-        .build()
 }
 
-fn filter_running_or_pending() -> Filter {
-    Filter::builder()
+fn filter_running_or_pending() -> ec2::Filter {
+    ec2::Filter::default()
         .name("instance-state-name")
         .values("pending")
         .values("running")
-        .build()
 }
 
-fn filter_active_states() -> Filter {
-    Filter::builder()
+fn filter_active_states() -> ec2::Filter {
+    ec2::Filter::default()
         .name("instance-state-name")
         .values("pending")
         .values("running")
         .values("stopping")
         .values("stopped")
-        .build()
 }
 
-fn filter_auto_cleanup_true() -> Filter {
-    Filter::builder()
+fn filter_auto_cleanup_true() -> ec2::Filter {
+    ec2::Filter::default()
         .name("tag:AutoCleanup")
         .values("true")
-        .build()
 }
 
 #[derive(Debug, Serialize, Tabled)]
@@ -107,7 +100,7 @@ async fn launch_instances_impl(
     config: &LaunchConfig,
     number: usize,
 ) -> Result<LaunchResult> {
-    let clients = AwsClients::new(config.region.clone()).await?;
+    let clients = AwsClients::new(config.region.clone())?;
     let spotty_config = Config::load()?;
 
     // Get candidate instance types
@@ -187,40 +180,30 @@ async fn launch_instances_impl(
         };
 
         // Build spot options with max price
-        let mut spot_opts = SpotMarketOptions::builder();
+        let mut spot_opts = ec2::SpotMarketOptions::default();
         if let Some(mp) = config.max_price {
             spot_opts = spot_opts.max_price(format!("{:.4}", mp));
         }
 
-        let market_opts = InstanceMarketOptionsRequest::builder()
-            .market_type(MarketType::Spot)
-            .spot_options(spot_opts.build())
-            .build();
+        let market_opts = ec2::InstanceMarketOptionsRequest::default()
+            .market_type(ec2::MarketType::Spot)
+            .spot_options(spot_opts);
 
-        let tags = TagSpecification::builder()
-            .resource_type(ResourceType::Instance)
-            .tags(Tag::builder().key("Name").value(&instance_name).build())
-            .tags(Tag::builder().key("ManagedBy").value("spotty").build())
-            .tags(Tag::builder().key("AutoCleanup").value(auto_cleanup_value).build())
-            .build();
+        let tags = ec2::TagSpecification::default()
+            .resource_type(ec2::ResourceType::Instance)
+            .tags(ec2::Tag::default().key("Name").value(instance_name.clone()))
+            .tags(ec2::Tag::default().key("ManagedBy").value("spotty"))
+            .tags(ec2::Tag::default().key("AutoCleanup").value(auto_cleanup_value));
 
         // Parse instance type
-        let it: InstanceType = match instance_type_str.parse() {
-            Ok(it) => it,
-            Err(_) => {
-                eprintln!("  Invalid instance type, skipping");
-                continue;
-            }
-        };
+        let it = ec2::InstanceType::from(instance_type_str.as_str());
 
         // Launch instance(s)
-        let mut req = clients
-            .ec2
-            .run_instances()
-            .image_id(&ami_id)
+        let mut req = ec2::RunInstancesRequest::default()
+            .image_id(ami_id)
             .instance_type(it)
-            .key_name(&key)
-            .security_group_ids(&sg)
+            .key_name(key.clone())
+            .security_group_ids(sg.clone())
             .instance_market_options(market_opts)
             .tag_specifications(tags)
             .min_count(number as i32)
@@ -232,22 +215,20 @@ async fn launch_instances_impl(
 
         if let Some(size) = config.volume_size {
             req = req.block_device_mappings(
-                aws_sdk_ec2::types::BlockDeviceMapping::builder()
+                ec2::BlockDeviceMapping::default()
                     .device_name("/dev/xvda")
                     .ebs(
-                        aws_sdk_ec2::types::EbsBlockDevice::builder()
+                        ec2::EbsBlockDevice::default()
                             .volume_size(size)
-                            .volume_type(aws_sdk_ec2::types::VolumeType::Gp3)
-                            .delete_on_termination(true)
-                            .build(),
-                    )
-                    .build(),
+                            .volume_type(ec2::VolumeType::Gp3)
+                            .delete_on_termination(true),
+                    ),
             );
         }
 
-        match req.send().await {
+        match ec2::run_instances(&clients.client, req).await {
             Ok(resp) => {
-                let instances = resp.instances();
+                let instances: Vec<_> = resp.instances.iter().flat_map(|l| &l.item).collect();
                 if instances.is_empty() {
                     eprintln!("  No instances returned");
                     continue;
@@ -255,9 +236,9 @@ async fn launch_instances_impl(
 
                 let mut instance_ids: Vec<String> = Vec::new();
                 for instance in instances {
-                    if let Some(id) = instance.instance_id() {
+                    if let Some(ref id) = instance.instance_id {
                         eprintln!("  Instance {} launched!", id);
-                        instance_ids.push(id.to_string());
+                        instance_ids.push(id.clone());
 
                         // Track instance in local state
                         let auto_cleanup = !config.no_auto_cleanup;
@@ -270,18 +251,22 @@ async fn launch_instances_impl(
                 return Ok(LaunchResult { instance_ids });
             }
             Err(e) => {
-                let error_str = format!("{:?}", e);
+                let error_str = format!("{}", e);
                 if error_str.contains("InsufficientInstanceCapacity") {
                     eprintln!("  No capacity available");
                 } else if error_str.contains("SpotMaxPriceTooLow") {
                     eprintln!("  Spot price too low");
                 } else {
-                    // Extract the actual error message from the SDK error
-                    let msg = e.meta().message().unwrap_or("unknown error");
-                    let code = e.meta().code().unwrap_or("unknown");
-                    eprintln!("  Failed: {} ({})", msg, code);
+                    match &e {
+                        AwsError::AwsService { code, message } => {
+                            eprintln!("  Failed: {} ({})", message, code);
+                        }
+                        _ => {
+                            eprintln!("  Failed: {}", e);
+                        }
+                    }
                 }
-                last_error = Some(e.into());
+                last_error = Some(anyhow::anyhow!("{}", e));
                 continue;
             }
         }
@@ -304,7 +289,7 @@ pub async fn start_instances(
 ) -> Result<()> {
     let region = config.region.clone();
     let result = launch_instances_impl(&config, number).await?;
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
     if wait {
         eprintln!("Waiting for instances to be running...");
@@ -332,7 +317,7 @@ pub async fn start_instances(
 pub async fn start_instance_and_get_id(config: LaunchConfig) -> Result<String> {
     let region = config.region.clone();
     let result = launch_instances_impl(&config, 1).await?;
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
     let instance_id = result.instance_ids.into_iter().next()
         .ok_or_else(|| anyhow::anyhow!("No instance ID returned"))?;
@@ -422,32 +407,27 @@ async fn fetch_spot_prices_for_types(
 ) -> Result<HashMap<String, (String, f64)>> {
     let mut result = HashMap::new();
 
-    let resp = clients
-        .ec2
-        .describe_spot_price_history()
-        .start_time(aws_sdk_ec2::primitives::DateTime::from_secs(
-            Utc::now().timestamp(),
-        ))
+    let mut req = ec2::DescribeSpotPriceHistoryRequest::default()
+        .start_time(Utc::now().to_rfc3339())
         .filters(
-            Filter::builder()
+            ec2::Filter::default()
                 .name("product-description")
-                .values("Linux/UNIX")
-                .build(),
-        )
-        .set_instance_types(Some(
-            types
-                .iter()
-                .filter_map(|it| it.parse().ok())
-                .collect(),
-        ))
-        .send()
-        .await?;
+                .values("Linux/UNIX"),
+        );
 
-    for history in resp.spot_price_history() {
+    for it in types {
+        req = req.instance_types(ec2::InstanceType::from(it.as_str()));
+    }
+
+    let resp = ec2::describe_spot_price_history(&clients.client, req)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    for history in resp.spot_price_history.iter().flat_map(|l| &l.item) {
         if let (Some(it), Some(az), Some(price_str)) = (
-            history.instance_type(),
-            history.availability_zone(),
-            history.spot_price(),
+            &history.instance_type,
+            &history.availability_zone,
+            &history.spot_price,
         ) {
             if let Ok(price) = price_str.parse::<f64>() {
                 let key = it.to_string();
@@ -474,30 +454,27 @@ pub async fn fetch_all_spot_prices(clients: &AwsClients) -> Result<Vec<(String, 
     let mut next_token: Option<String> = None;
 
     loop {
-        let mut req = clients
-            .ec2
-            .describe_spot_price_history()
-            .start_time(aws_sdk_ec2::primitives::DateTime::from_secs(
-                Utc::now().timestamp(),
-            ))
+        let mut req = ec2::DescribeSpotPriceHistoryRequest::default()
+            .start_time(Utc::now().to_rfc3339())
             .filters(
-                Filter::builder()
+                ec2::Filter::default()
                     .name("product-description")
-                    .values("Linux/UNIX")
-                    .build(),
+                    .values("Linux/UNIX"),
             );
 
         if let Some(token) = next_token {
             req = req.next_token(token);
         }
 
-        let resp = req.send().await?;
+        let resp = ec2::describe_spot_price_history(&clients.client, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        for history in resp.spot_price_history() {
+        for history in resp.spot_price_history.iter().flat_map(|l| &l.item) {
             if let (Some(it), Some(az), Some(price_str)) = (
-                history.instance_type(),
-                history.availability_zone(),
-                history.spot_price(),
+                &history.instance_type,
+                &history.availability_zone,
+                &history.spot_price,
             ) {
                 if let Ok(price) = price_str.parse::<f64>() {
                     prices.push((it.to_string(), az.to_string(), price));
@@ -505,7 +482,7 @@ pub async fn fetch_all_spot_prices(clients: &AwsClients) -> Result<Vec<(String, 
             }
         }
 
-        next_token = resp.next_token().map(String::from);
+        next_token = resp.next_token.clone();
         if next_token.is_none() {
             break;
         }
@@ -548,22 +525,23 @@ pub async fn stop_instances(
         }
     }
 
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
     // If --all, find all spotty-managed running instances
     if all {
-        let resp = clients
-            .ec2
-            .describe_instances()
-            .filters(filter_managed_by_spotty())
-            .filters(filter_running_or_pending())
-            .send()
-            .await?;
+        let resp = ec2::describe_instances(
+            &clients.client,
+            ec2::DescribeInstancesRequest::default()
+                .filters(filter_managed_by_spotty())
+                .filters(filter_running_or_pending()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        for reservation in resp.reservations() {
-            for instance in reservation.instances() {
-                if let Some(id) = instance.instance_id() {
-                    instance_ids.push(id.to_string());
+        for reservation in resp.reservations.iter().flat_map(|l| &l.item) {
+            for instance in reservation.instances.iter().flat_map(|l| &l.item) {
+                if let Some(ref id) = instance.instance_id {
+                    instance_ids.push(id.clone());
                 }
             }
         }
@@ -574,12 +552,13 @@ pub async fn stop_instances(
         return Ok(());
     }
 
-    clients
-        .ec2
-        .terminate_instances()
-        .set_instance_ids(Some(instance_ids.clone()))
-        .send()
-        .await?;
+    let req = ec2::TerminateInstancesRequest {
+        instance_ids: ec2::InstanceIdStringList::from(instance_ids.clone()),
+        ..Default::default()
+    };
+    ec2::terminate_instances(&clients.client, req)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Untrack terminated instances
     if let Err(e) = crate::state::untrack_instances(&instance_ids) {
@@ -608,18 +587,18 @@ pub async fn instance_status(
     }
 
     // Add user's region (let AwsClients resolve from CLI/config/AWS SDK)
-    let user_clients = AwsClients::new(region).await?;
+    let user_clients = AwsClients::new(region)?;
     regions_to_query.insert(user_clients.region.clone());
 
     let mut all_instances: Vec<InstanceInfo> = Vec::new();
 
     for region in &regions_to_query {
-        let clients = AwsClients::new(Some(region.clone())).await?;
+        let clients = AwsClients::new(Some(region.clone()))?;
 
-        let mut req = clients.ec2.describe_instances();
+        let mut req = ec2::DescribeInstancesRequest::default();
 
         if !instance_ids.is_empty() {
-            req = req.set_instance_ids(Some(instance_ids.clone()));
+            req.instance_ids = Some(ec2::InstanceIdStringList::from(instance_ids.clone()));
         } else {
             req = req.filters(filter_managed_by_spotty());
         }
@@ -628,17 +607,19 @@ pub async fn instance_status(
             req = req.filters(filter_active_states());
         }
 
-        let resp = req.send().await?;
+        let resp = ec2::describe_instances(&clients.client, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Collect instance types and AZs to fetch spot prices
         let mut spot_queries: Vec<(String, String)> = Vec::new();
-        for reservation in resp.reservations() {
-            for instance in reservation.instances() {
+        for reservation in resp.reservations.iter().flat_map(|l| &l.item) {
+            for instance in reservation.instances.iter().flat_map(|l| &l.item) {
                 if let (Some(it), Some(az)) = (
-                    instance.instance_type().map(|t| t.to_string()),
-                    instance.placement().and_then(|p| p.availability_zone()),
+                    instance.instance_type.as_ref().map(|t| t.to_string()),
+                    instance.placement.as_ref().and_then(|p| p.availability_zone.as_ref()),
                 ) {
-                    spot_queries.push((it, az.to_string()));
+                    spot_queries.push((it, az.clone()));
                 }
             }
         }
@@ -651,8 +632,8 @@ pub async fn instance_status(
         let spot_prices = spot_prices?;
         let instance_types = instance_types?;
 
-        for reservation in resp.reservations() {
-            for instance in reservation.instances() {
+        for reservation in resp.reservations.iter().flat_map(|l| &l.item) {
+            for instance in reservation.instances.iter().flat_map(|l| &l.item) {
                 all_instances.push(parse_instance(instance, &spot_prices, &instance_types));
             }
         }
@@ -716,32 +697,27 @@ async fn fetch_current_spot_prices(
 
     let instance_types: Vec<_> = queries.iter().map(|(it, _)| it.clone()).collect();
 
-    let resp = clients
-        .ec2
-        .describe_spot_price_history()
-        .start_time(aws_sdk_ec2::primitives::DateTime::from_secs(
-            chrono::Utc::now().timestamp(),
-        ))
+    let mut req = ec2::DescribeSpotPriceHistoryRequest::default()
+        .start_time(chrono::Utc::now().to_rfc3339())
         .filters(
-            Filter::builder()
+            ec2::Filter::default()
                 .name("product-description")
-                .values("Linux/UNIX")
-                .build(),
-        )
-        .set_instance_types(Some(
-            instance_types
-                .iter()
-                .filter_map(|it| it.parse().ok())
-                .collect(),
-        ))
-        .send()
-        .await?;
+                .values("Linux/UNIX"),
+        );
 
-    for history in resp.spot_price_history() {
+    for it in &instance_types {
+        req = req.instance_types(ec2::InstanceType::from(it.as_str()));
+    }
+
+    let resp = ec2::describe_spot_price_history(&clients.client, req)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    for history in resp.spot_price_history.iter().flat_map(|l| &l.item) {
         if let (Some(it), Some(az), Some(price_str)) = (
-            history.instance_type(),
-            history.availability_zone(),
-            history.spot_price(),
+            &history.instance_type,
+            &history.availability_zone,
+            &history.spot_price,
         ) {
             if let Ok(price) = price_str.parse::<f64>() {
                 let key = (it.to_string(), az.to_string());
@@ -754,12 +730,18 @@ async fn fetch_current_spot_prices(
 }
 
 async fn discover_key_pair(clients: &AwsClients) -> Result<String> {
-    let resp = clients.ec2.describe_key_pairs().send().await?;
+    let resp = ec2::describe_key_pairs(
+        &clients.client,
+        ec2::DescribeKeyPairsRequest::default(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let keys: Vec<_> = resp
-        .key_pairs()
+        .key_pairs
         .iter()
-        .filter_map(|k| k.key_name())
+        .flat_map(|l| &l.item)
+        .filter_map(|k| k.key_name.as_deref())
         .collect();
 
     match keys.len() {
@@ -789,17 +771,17 @@ async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<Strin
         arch
     );
 
-    let resp = clients
-        .ssm
-        .get_parameter()
-        .name(&param_name)
-        .send()
-        .await
-        .with_context(|| format!("Failed to discover AMI for {}", arch))?;
+    let resp = crate::ssm::get_parameter(
+        &clients.client,
+        crate::ssm::GetParameterRequest::default().name(param_name.clone()),
+    )
+    .await
+    .with_context(|| format!("Failed to discover AMI for {}", arch))?;
 
     let ami = resp
-        .parameter()
-        .and_then(|p| p.value())
+        .parameter
+        .as_ref()
+        .and_then(|p| p.value.as_deref())
         .ok_or_else(|| anyhow::anyhow!("No AMI found for {}", arch))?;
 
     eprintln!("Using AMI: {} ({})", ami, arch);
@@ -808,87 +790,99 @@ async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<Strin
 
 async fn ensure_default_security_group(clients: &AwsClients) -> Result<String> {
     // Check if spotty-default exists
-    let resp = clients
-        .ec2
-        .describe_security_groups()
-        .filters(
-            Filter::builder()
-                .name("group-name")
-                .values("spotty-default")
-                .build(),
-        )
-        .send()
-        .await?;
+    let resp = ec2::describe_security_groups(
+        &clients.client,
+        ec2::DescribeSecurityGroupsRequest::default()
+            .filters(
+                ec2::Filter::default()
+                    .name("group-name")
+                    .values("spotty-default"),
+            ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    if let Some(sg) = resp.security_groups().first() {
-        if let Some(id) = sg.group_id() {
-            return Ok(id.to_string());
+    if let Some(sg) = resp.security_groups.as_ref().and_then(|l| l.item.first()) {
+        if let Some(ref id) = sg.group_id {
+            return Ok(id.clone());
         }
     }
 
     // Get default VPC
-    let vpcs = clients
-        .ec2
-        .describe_vpcs()
-        .filters(Filter::builder().name("is-default").values("true").build())
-        .send()
-        .await?;
+    let vpcs = ec2::describe_vpcs(
+        &clients.client,
+        ec2::DescribeVpcsRequest::default()
+            .filters(
+                ec2::Filter::default()
+                    .name("is-default")
+                    .values("true"),
+            ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let vpc_id = vpcs
-        .vpcs()
-        .first()
-        .and_then(|v| v.vpc_id())
+        .vpcs
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .and_then(|v| v.vpc_id.as_deref())
         .ok_or_else(|| anyhow::anyhow!("No default VPC found"))?;
 
     // Create security group
-    let create_resp = clients
-        .ec2
-        .create_security_group()
-        .group_name("spotty-default")
-        .description("Default security group for spotty instances")
-        .vpc_id(vpc_id)
-        .send()
-        .await?;
+    let create_resp = ec2::create_security_group(
+        &clients.client,
+        ec2::CreateSecurityGroupRequest::default()
+            .group_name("spotty-default")
+            .description("Default security group for spotty instances")
+            .vpc_id(vpc_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let sg_id = create_resp
-        .group_id()
+        .group_id
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Failed to create security group"))?;
 
     // Add SSH ingress rule (0.0.0.0/0 - user should restrict this)
-    clients
-        .ec2
-        .authorize_security_group_ingress()
-        .group_id(sg_id)
-        .ip_protocol("tcp")
-        .from_port(22)
-        .to_port(22)
-        .cidr_ip("0.0.0.0/0")
-        .send()
-        .await?;
+    ec2::authorize_security_group_ingress(
+        &clients.client,
+        ec2::AuthorizeSecurityGroupIngressRequest::default()
+            .group_id(sg_id.clone())
+            .ip_protocol("tcp")
+            .from_port(22)
+            .to_port(22)
+            .cidr_ip("0.0.0.0/0"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     eprintln!("Created security group: {} (allows SSH from anywhere)", sg_id);
-    Ok(sg_id.to_string())
+    Ok(sg_id.clone())
 }
 
 async fn wait_for_running(clients: &AwsClients, instance_id: &str) -> Result<()> {
     loop {
-        let resp = clients
-            .ec2
-            .describe_instances()
-            .instance_ids(instance_id)
-            .send()
-            .await?;
+        let resp = ec2::describe_instances(
+            &clients.client,
+            ec2::DescribeInstancesRequest::default()
+                .instance_ids(instance_id),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let state = resp
-            .reservations()
-            .first()
-            .and_then(|r| r.instances().first())
-            .and_then(|i| i.state())
-            .and_then(|s| s.name())
-            .map(|n| n.as_str())
-            .unwrap_or("unknown");
+            .reservations
+            .as_ref()
+            .and_then(|l| l.item.first())
+            .and_then(|r| r.instances.as_ref())
+            .and_then(|l| l.item.first())
+            .and_then(|i| i.state.as_ref())
+            .and_then(|s| s.name.as_ref())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
-        match state {
+        match state.as_str() {
             "running" => {
                 eprintln!("Instance is running");
                 return Ok(());
@@ -905,17 +899,20 @@ async fn wait_for_running(clients: &AwsClients, instance_id: &str) -> Result<()>
 }
 
 async fn get_instance_info(clients: &AwsClients, instance_id: &str) -> Result<InstanceInfo> {
-    let resp = clients
-        .ec2
-        .describe_instances()
-        .instance_ids(instance_id)
-        .send()
-        .await?;
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .instance_ids(instance_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let instance = resp
-        .reservations()
-        .first()
-        .and_then(|r| r.instances().first())
+        .reservations
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .and_then(|r| r.instances.as_ref())
+        .and_then(|l| l.item.first())
         .ok_or_else(|| anyhow::anyhow!("Instance not found"))?;
 
     Ok(parse_instance(instance, &HashMap::new(), &HashMap::new()))
@@ -925,18 +922,21 @@ pub async fn get_instance_public_ip(
     clients: &AwsClients,
     instance_id: &str,
 ) -> Result<String> {
-    let resp = clients
-        .ec2
-        .describe_instances()
-        .instance_ids(instance_id)
-        .send()
-        .await?;
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .instance_ids(instance_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let ip = resp
-        .reservations()
-        .first()
-        .and_then(|r| r.instances().first())
-        .and_then(|i| i.public_ip_address())
+        .reservations
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .and_then(|r| r.instances.as_ref())
+        .and_then(|l| l.item.first())
+        .and_then(|i| i.public_ip_address.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Instance has no public IP"))?;
 
     Ok(ip.to_string())
@@ -946,38 +946,44 @@ pub async fn get_instance_key_name(
     clients: &AwsClients,
     instance_id: &str,
 ) -> Result<String> {
-    let resp = clients
-        .ec2
-        .describe_instances()
-        .instance_ids(instance_id)
-        .send()
-        .await?;
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .instance_ids(instance_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let key_name = resp
-        .reservations()
-        .first()
-        .and_then(|r| r.instances().first())
-        .and_then(|i| i.key_name())
+        .reservations
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .and_then(|r| r.instances.as_ref())
+        .and_then(|l| l.item.first())
+        .and_then(|i| i.key_name.as_deref())
         .ok_or_else(|| anyhow::anyhow!("Instance has no key name"))?;
 
     Ok(key_name.to_string())
 }
 
 fn parse_instance(
-    instance: &aws_sdk_ec2::types::Instance,
+    instance: &ec2::Instance,
     spot_prices: &HashMap<(String, String), f64>,
     instance_types: &HashMap<String, super::filters::InstanceTypeSpec>,
 ) -> InstanceInfo {
     let name = instance
-        .tags()
+        .tags
+        .as_ref()
         .iter()
-        .find(|t| t.key() == Some("Name"))
-        .and_then(|t| t.value())
+        .flat_map(|l| &l.item)
+        .find(|t| t.key.as_deref() == Some("Name"))
+        .and_then(|t| t.value.as_deref())
         .unwrap_or("-")
         .to_string();
 
     let instance_type = instance
-        .instance_type()
+        .instance_type
+        .as_ref()
         .map(|t| t.to_string())
         .unwrap_or_else(|| "-".to_string());
 
@@ -987,8 +993,9 @@ fn parse_instance(
         .unwrap_or((0, "-".to_string()));
 
     let az = instance
-        .placement()
-        .and_then(|p| p.availability_zone())
+        .placement
+        .as_ref()
+        .and_then(|p| p.availability_zone.as_deref())
         .unwrap_or("-");
 
     // Get spot price for this instance type + AZ
@@ -997,8 +1004,12 @@ fn parse_instance(
         .copied();
 
     // Calculate running time and cost
-    let (running_time, running_secs, cost, rate) = if let Some(launch) = instance.launch_time() {
-        let launch_secs = launch.secs();
+    let (running_time, running_secs, cost, rate) = if let Some(ref launch) = instance.launch_time {
+        // Parse launch time string to get seconds
+        let launch_secs = chrono::DateTime::parse_from_rfc3339(launch)
+            .or_else(|_| chrono::DateTime::parse_from_str(launch, "%Y-%m-%dT%H:%M:%S%.fZ"))
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
         let now_secs = Utc::now().timestamp();
         let running_secs = (now_secs - launch_secs).max(0) as u64;
 
@@ -1024,17 +1035,19 @@ fn parse_instance(
     };
 
     InstanceInfo {
-        instance_id: instance.instance_id().unwrap_or("-").to_string(),
+        instance_id: instance.instance_id.as_deref().unwrap_or("-").to_string(),
         name,
         instance_type,
         arch,
         state: instance
-            .state()
-            .and_then(|s| s.name())
-            .map(|n| n.as_str().to_string())
+            .state
+            .as_ref()
+            .and_then(|s| s.name.as_ref())
+            .map(|n| n.to_string())
             .unwrap_or_else(|| "-".to_string()),
         public_ip: instance
-            .public_ip_address()
+            .public_ip_address
+            .as_deref()
             .unwrap_or("-")
             .to_string(),
         rate,
@@ -1080,24 +1093,25 @@ pub async fn stop_auto_cleanup_instances(_region: Option<String>) -> Result<Vec<
     let mut all_terminated: Vec<String> = Vec::new();
 
     for region in regions {
-        let clients = AwsClients::new(Some(region.clone())).await?;
+        let clients = AwsClients::new(Some(region.clone()))?;
 
         // Query instances with ManagedBy=spotty AND AutoCleanup=true AND running/pending
-        let resp = clients
-            .ec2
-            .describe_instances()
-            .filters(filter_managed_by_spotty())
-            .filters(filter_auto_cleanup_true())
-            .filters(filter_running_or_pending())
-            .send()
-            .await?;
+        let resp = ec2::describe_instances(
+            &clients.client,
+            ec2::DescribeInstancesRequest::default()
+                .filters(filter_managed_by_spotty())
+                .filters(filter_auto_cleanup_true())
+                .filters(filter_running_or_pending()),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let mut instance_ids: Vec<String> = Vec::new();
 
-        for reservation in resp.reservations() {
-            for instance in reservation.instances() {
-                if let Some(id) = instance.instance_id() {
-                    instance_ids.push(id.to_string());
+        for reservation in resp.reservations.iter().flat_map(|l| &l.item) {
+            for instance in reservation.instances.iter().flat_map(|l| &l.item) {
+                if let Some(ref id) = instance.instance_id {
+                    instance_ids.push(id.clone());
                 }
             }
         }
@@ -1107,12 +1121,13 @@ pub async fn stop_auto_cleanup_instances(_region: Option<String>) -> Result<Vec<
         }
 
         // Terminate without confirmation (daemon use)
-        clients
-            .ec2
-            .terminate_instances()
-            .set_instance_ids(Some(instance_ids.clone()))
-            .send()
-            .await?;
+        let req = ec2::TerminateInstancesRequest {
+            instance_ids: ec2::InstanceIdStringList::from(instance_ids.clone()),
+            ..Default::default()
+        };
+        ec2::terminate_instances(&clients.client, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         all_terminated.extend(instance_ids);
     }
@@ -1138,33 +1153,37 @@ pub struct RunningInstance {
 
 /// Get list of running spotty-managed instances.
 pub async fn get_running_instances(region: Option<String>) -> Result<Vec<RunningInstance>> {
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
-    let resp = clients
-        .ec2
-        .describe_instances()
-        .filters(filter_managed_by_spotty())
-        .filters(filter_running_or_pending())
-        .send()
-        .await?;
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .filters(filter_managed_by_spotty())
+            .filters(filter_running_or_pending()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let mut instances: Vec<RunningInstance> = Vec::new();
 
-    for reservation in resp.reservations() {
-        for instance in reservation.instances() {
-            let instance_id = instance.instance_id().unwrap_or("-").to_string();
+    for reservation in resp.reservations.iter().flat_map(|l| &l.item) {
+        for instance in reservation.instances.iter().flat_map(|l| &l.item) {
+            let instance_id = instance.instance_id.as_deref().unwrap_or("-").to_string();
             let name = instance
-                .tags()
+                .tags
+                .as_ref()
                 .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
+                .flat_map(|l| &l.item)
+                .find(|t| t.key.as_deref() == Some("Name"))
+                .and_then(|t| t.value.as_deref())
                 .unwrap_or("-")
                 .to_string();
             let instance_type = instance
-                .instance_type()
+                .instance_type
+                .as_ref()
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let public_ip = instance.public_ip_address().map(String::from);
+            let public_ip = instance.public_ip_address.clone();
 
             instances.push(RunningInstance {
                 instance_id,

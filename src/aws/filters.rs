@@ -1,5 +1,4 @@
 use anyhow::Result;
-use aws_sdk_ec2::types::InstanceTypeInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -7,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use super::client::AwsClients;
+use crate::ec2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceTypeSpec {
@@ -105,20 +105,22 @@ pub async fn get_instance_types(
     let mut next_token: Option<String> = None;
 
     loop {
-        let mut req = clients.ec2.describe_instance_types();
+        let mut req = ec2::DescribeInstanceTypesRequest::default();
         if let Some(token) = next_token {
             req = req.next_token(token);
         }
 
-        let resp = req.send().await?;
+        let resp = ec2::describe_instance_types(&clients.client, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        for info in resp.instance_types() {
+        for info in resp.instance_types.iter().flat_map(|l| &l.item) {
             if let Some(spec) = parse_instance_type_info(info) {
                 instance_types.insert(spec.instance_type.clone(), spec);
             }
         }
 
-        next_token = resp.next_token().map(String::from);
+        next_token = resp.next_token.clone();
         if next_token.is_none() {
             break;
         }
@@ -130,18 +132,21 @@ pub async fn get_instance_types(
     Ok(instance_types)
 }
 
-fn parse_instance_type_info(info: &InstanceTypeInfo) -> Option<InstanceTypeSpec> {
-    let instance_type = info.instance_type()?.to_string();
+fn parse_instance_type_info(info: &ec2::InstanceTypeInfo) -> Option<InstanceTypeSpec> {
+    let instance_type = info.instance_type.as_ref()?.to_string();
 
-    let vcpu = info.v_cpu_info()?.default_v_cpus()?;
+    let vcpu = info.v_cpu_info.as_ref()?.default_v_cpus?;
 
-    let memory_mb = info.memory_info()?.size_in_mib()?;
+    let memory_mb = info.memory_info.as_ref()?.size_in_mi_b?;
 
     let architectures = info
-        .processor_info()?
-        .supported_architectures()
+        .processor_info
+        .as_ref()?
+        .supported_architectures
+        .as_ref()?
+        .item
         .iter()
-        .map(|a| a.as_str().to_string())
+        .map(|a| a.to_string())
         .collect();
 
     Some(InstanceTypeSpec {

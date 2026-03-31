@@ -316,33 +316,33 @@ const WATCHER_POLICY: &str = r#"{
 /// Set up the watcher with dedicated IAM credentials.
 /// Creates an IAM user with minimal permissions and stores credentials locally.
 pub async fn setup(region: Option<String>) -> Result<()> {
-    use aws_sdk_iam::Client as IamClient;
+    use aws_runtime_async::aws::Client;
+    use crate::iam;
 
     eprintln!("Setting up spotty-watcher IAM user with minimal permissions...\n");
 
-    // Load AWS config (uses current credentials - needs IAM permissions)
-    let config = if let Some(ref r) = region {
-        aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(r.clone()))
-            .load()
-            .await
-    } else {
-        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await
-    };
-
-    let iam = IamClient::new(&config);
+    let mut client = Client::from_env();
+    if let Some(ref r) = region {
+        client.creds.region = r.clone();
+    }
 
     // Step 1: Create IAM user (or check if exists)
     eprint!("Creating IAM user '{}'... ", IAM_USER_NAME);
-    let user_exists = match iam.get_user().user_name(IAM_USER_NAME).send().await {
+    let user_exists = match iam::get_user(
+        &client,
+        iam::GetUserRequest::default().user_name(IAM_USER_NAME),
+    ).await {
         Ok(_) => {
             eprintln!("already exists");
             true
         }
         Err(e) => {
-            let err_str = format!("{:?}", e);
+            let err_str = format!("{}", e);
             if err_str.contains("NoSuchEntity") {
-                match iam.create_user().user_name(IAM_USER_NAME).send().await {
+                match iam::create_user(
+                    &client,
+                    iam::CreateUserRequest::default().user_name(IAM_USER_NAME),
+                ).await {
                     Ok(_) => {
                         eprintln!("created");
                         false
@@ -359,13 +359,16 @@ pub async fn setup(region: Option<String>) -> Result<()> {
 
     // Step 2: Attach inline policy
     eprint!("Attaching minimal permissions policy... ");
-    iam.put_user_policy()
-        .user_name(IAM_USER_NAME)
-        .policy_name("spotty-watcher-policy")
-        .policy_document(WATCHER_POLICY)
-        .send()
-        .await
-        .context("Failed to attach policy")?;
+    iam::put_user_policy(
+        &client,
+        iam::PutUserPolicyRequest::default()
+            .user_name(IAM_USER_NAME)
+            .policy_name("spotty-watcher-policy")
+            .policy_document(WATCHER_POLICY),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))
+    .context("Failed to attach policy")?;
     eprintln!("done");
 
     // Step 3: Create access keys (only if user was just created or no keys exist)
@@ -381,38 +384,34 @@ pub async fn setup(region: Option<String>) -> Result<()> {
         eprint!("Creating access keys... ");
 
         // Delete existing access keys first (max 2 per user)
-        if let Ok(keys) = iam
-            .list_access_keys()
-            .user_name(IAM_USER_NAME)
-            .send()
-            .await
-        {
-            for key in keys.access_key_metadata() {
-                if let Some(key_id) = key.access_key_id() {
-                    let _ = iam
-                        .delete_access_key()
-                        .user_name(IAM_USER_NAME)
-                        .access_key_id(key_id)
-                        .send()
-                        .await;
+        if let Ok(keys) = iam::list_access_keys(
+            &client,
+            iam::ListAccessKeysRequest::default().user_name(IAM_USER_NAME),
+        ).await {
+            for key in &keys.access_key_metadata.item {
+                if let Some(ref key_id) = key.access_key_id {
+                    let _ = iam::delete_access_key(
+                        &client,
+                        iam::DeleteAccessKeyRequest::default()
+                            .user_name(IAM_USER_NAME)
+                            .access_key_id(key_id.clone()),
+                    ).await;
                 }
             }
         }
 
         // Create new access key
-        let key_response = iam
-            .create_access_key()
-            .user_name(IAM_USER_NAME)
-            .send()
-            .await
-            .context("Failed to create access key")?;
+        let key_response = iam::create_access_key(
+            &client,
+            iam::CreateAccessKeyRequest::default().user_name(IAM_USER_NAME),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .context("Failed to create access key")?;
 
-        let access_key = key_response
-            .access_key()
-            .ok_or_else(|| anyhow::anyhow!("No access key in response"))?;
-
-        let access_key_id = access_key.access_key_id();
-        let secret_key = access_key.secret_access_key();
+        let access_key = &key_response.access_key;
+        let access_key_id = &access_key.access_key_id;
+        let secret_key = &access_key.secret_access_key;
 
         eprintln!("done");
 

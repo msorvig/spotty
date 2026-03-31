@@ -304,7 +304,7 @@ async fn main() -> Result<()> {
     // Initialize tracing if --trace flag is set
     if cli.trace {
         tracing_subscriber::fmt()
-            .with_env_filter("spotty=debug,aws_config=debug,aws_sdk_ec2=debug")
+            .with_env_filter("spotty=debug")
             .with_target(true)
             .init();
         tracing::debug!("Tracing enabled");

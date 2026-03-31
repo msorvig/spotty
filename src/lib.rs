@@ -2,6 +2,27 @@
 //!
 //! This library provides APIs for managing AWS EC2 spot instances.
 
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod ec2 {
+    include!(concat!(env!("OUT_DIR"), "/ec2.rs"));
+
+    impl From<&str> for InstanceType {
+        fn from(s: &str) -> Self {
+            Self::from_str(s)
+        }
+    }
+}
+
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod ssm {
+    include!(concat!(env!("OUT_DIR"), "/ssm.rs"));
+}
+
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod iam {
+    include!(concat!(env!("OUT_DIR"), "/iam.rs"));
+}
+
 pub mod aws;
 pub mod config;
 pub mod keys;

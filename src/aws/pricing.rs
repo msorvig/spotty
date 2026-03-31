@@ -1,5 +1,4 @@
 use anyhow::Result;
-use aws_sdk_ec2::types::Filter;
 use chrono::Utc;
 use serde::Serialize;
 use tabled::Tabled;
@@ -8,6 +7,7 @@ use tracing::{debug, instrument};
 use super::client::AwsClients;
 use super::filters::{get_instance_types, InstanceTypeFilter};
 use super::instances::fetch_all_spot_prices;
+use crate::ec2;
 use crate::{output, SortField};
 
 #[derive(Debug, Serialize, Tabled)]
@@ -46,7 +46,7 @@ pub async fn list_spot_prices(
     json: bool,
 ) -> Result<()> {
     debug!("Creating AWS clients");
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
     debug!(region = %clients.region, "Using region");
 
     eprintln!("Fetching prices...");
@@ -152,27 +152,27 @@ async fn fetch_spot_prices_for_type(
 ) -> Result<Vec<(String, String, f64)>> {
     let mut prices = Vec::new();
 
-    let resp = clients
-        .ec2
-        .describe_spot_price_history()
-        .start_time(aws_sdk_ec2::primitives::DateTime::from_secs(
-            Utc::now().timestamp(),
-        ))
-        .filters(
-            Filter::builder()
-                .name("product-description")
-                .values("Linux/UNIX")
-                .build(),
-        )
-        .instance_types(instance_type.parse()?)
-        .send()
-        .await?;
+    let it_enum = ec2::InstanceType::from(instance_type);
 
-    for history in resp.spot_price_history() {
+    let resp = ec2::describe_spot_price_history(
+        &clients.client,
+        ec2::DescribeSpotPriceHistoryRequest::default()
+            .start_time(Utc::now().to_rfc3339())
+            .filters(
+                ec2::Filter::default()
+                    .name("product-description")
+                    .values("Linux/UNIX"),
+            )
+            .instance_types(it_enum),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    for history in resp.spot_price_history.iter().flat_map(|l| &l.item) {
         if let (Some(it), Some(az), Some(price_str)) = (
-            history.instance_type(),
-            history.availability_zone(),
-            history.spot_price(),
+            &history.instance_type,
+            &history.availability_zone,
+            &history.spot_price,
         ) {
             if let Ok(price) = price_str.parse::<f64>() {
                 prices.push((it.to_string(), az.to_string(), price));

@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::aws::client::AwsClients;
+use crate::ec2;
 
 fn ssh_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME")?;
@@ -11,18 +12,20 @@ fn ssh_dir() -> Result<PathBuf> {
 }
 
 pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
     // Check if key already exists in AWS
-    let existing = clients
-        .ec2
-        .describe_key_pairs()
-        .key_names(name)
-        .send()
-        .await;
+    let existing = ec2::describe_key_pairs(
+        &clients.client,
+        ec2::DescribeKeyPairsRequest::default().key_names(name),
+    )
+    .await;
 
-    if existing.is_ok() && !existing.as_ref().unwrap().key_pairs().is_empty() {
-        bail!("Key pair '{}' already exists in AWS", name);
+    if let Ok(ref resp) = existing {
+        let has_keys = resp.key_pairs.as_ref().map_or(false, |l| !l.item.is_empty());
+        if has_keys {
+            bail!("Key pair '{}' already exists in AWS", name);
+        }
     }
 
     // Check if local file already exists
@@ -32,16 +35,18 @@ pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
     }
 
     // Create the key pair
-    let resp = clients
-        .ec2
-        .create_key_pair()
-        .key_name(name)
-        .key_type(aws_sdk_ec2::types::KeyType::Ed25519)
-        .send()
-        .await?;
+    let resp = ec2::create_key_pair(
+        &clients.client,
+        ec2::CreateKeyPairRequest::default()
+            .key_name(name)
+            .key_type(ec2::KeyType::Ed25519),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let private_key = resp
-        .key_material()
+        .key_material
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No key material returned"))?;
 
     // Ensure .ssh directory exists
@@ -61,21 +66,27 @@ pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
 }
 
 pub async fn list_key_pairs(region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
 
-    let resp = clients.ec2.describe_key_pairs().send().await?;
+    let resp = ec2::describe_key_pairs(
+        &clients.client,
+        ec2::DescribeKeyPairsRequest::default(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let ssh = ssh_dir()?;
 
     println!("{:<30} {:<15} {}", "NAME", "TYPE", "LOCAL FILE");
     println!("{}", "-".repeat(60));
 
-    for key in resp.key_pairs() {
-        let name = key.key_name().unwrap_or("-");
+    for key in resp.key_pairs.iter().flat_map(|l| &l.item) {
+        let name = key.key_name.as_deref().unwrap_or("-");
         let key_type = key
-            .key_type()
-            .map(|t| t.as_str())
-            .unwrap_or("-");
+            .key_type
+            .as_ref()
+            .map(|t| format!("{:?}", t))
+            .unwrap_or_else(|| "-".to_string());
 
         // Check for local key file
         let local_status = [

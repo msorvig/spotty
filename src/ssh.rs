@@ -15,7 +15,7 @@ pub async fn ssh_into_instance(
     command: Option<String>,
     region: Option<String>,
 ) -> Result<()> {
-    let clients = AwsClients::new(region).await?;
+    let clients = AwsClients::new(region)?;
     let config = Config::load()?;
 
     // Get instance public IP
