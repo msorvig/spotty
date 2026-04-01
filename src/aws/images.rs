@@ -8,7 +8,6 @@ use super::client::AwsClients;
 use super::instances::{self, LaunchConfig};
 use crate::config::Config;
 use crate::ec2;
-use crate::output;
 use crate::ssh;
 use crate::utils::{add_ssh_options, expand_tilde};
 
@@ -62,7 +61,7 @@ async fn get_image_sizes(
 }
 
 /// List available AMIs: base AL2023 images from SSM + spotty-created + config AMIs.
-pub async fn list_images(region: Option<String>, json: bool) -> Result<()> {
+pub async fn list_images(region: Option<String>) -> Result<Vec<AmiInfo>> {
     let clients = AwsClients::new(region)?;
     let config = Config::load().unwrap_or_default();
 
@@ -201,23 +200,17 @@ pub async fn list_images(region: Option<String>, json: bool) -> Result<()> {
         }
     }
 
-    if json {
-        output::print_json(&images)?;
-    } else {
-        output::print_table(&images);
-    }
-
-    Ok(())
+    Ok(images)
 }
 
-/// Create an AMI from a running instance.
+/// Create an AMI from a running instance. Returns the AMI ID.
 pub async fn create_image(
     instance_id: String,
     name: Option<String>,
     no_reboot: bool,
     wait: bool,
     region: Option<String>,
-) -> Result<()> {
+) -> Result<String> {
     let clients = AwsClients::new(region)?;
 
     // Verify instance exists and get its type
@@ -290,25 +283,15 @@ pub async fn create_image(
 
     let ami_id = create_resp
         .image_id
-        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No AMI ID returned"))?;
-
-    println!("{}", ami_id);
 
     if wait {
         eprintln!("Waiting for AMI to become available (this may take several minutes)...");
-        wait_for_image_available(&clients, ami_id).await?;
+        wait_for_image_available(&clients, &ami_id).await?;
         eprintln!("\nAMI is available.");
-    } else {
-        eprintln!("AMI creation started. It may take several minutes to become available.");
     }
 
-    eprintln!(
-        "Hint: spotty config set ami.{}-{} {}",
-        clients.region, arch, ami_id
-    );
-
-    Ok(())
+    Ok(ami_id)
 }
 
 /// Deregister an AMI and delete its backing snapshots.

@@ -10,7 +10,6 @@ use tabled::Tabled;
 use super::client::AwsClients;
 use crate::config::Config;
 use crate::ec2;
-use crate::output;
 use crate::utils::base64_encode;
 
 // Common EC2 filter builders to reduce duplication
@@ -280,13 +279,13 @@ async fn launch_instances_impl(
     )
 }
 
-/// Start one or more instances with the given configuration
+/// Start one or more instances with the given configuration.
+/// Returns info for all launched instances.
 pub async fn start_instances(
     config: LaunchConfig,
     number: usize,
     wait: bool,
-    json: bool,
-) -> Result<()> {
+) -> Result<Vec<InstanceInfo>> {
     let region = config.region.clone();
     let result = launch_instances_impl(&config, number).await?;
     let clients = AwsClients::new(region)?;
@@ -304,13 +303,7 @@ pub async fn start_instances(
         infos.push(get_instance_info(&clients, id).await?);
     }
 
-    if json {
-        output::print_json(&infos)?;
-    } else {
-        output::print_table(&infos);
-    }
-
-    Ok(())
+    Ok(infos)
 }
 
 /// Start an instance and return its ID (always waits for running state)
@@ -512,11 +505,12 @@ pub async fn fetch_all_spot_prices(clients: &AwsClients) -> Result<Vec<(String, 
         .collect())
 }
 
+/// Terminate instances. Returns list of terminated instance IDs.
 pub async fn stop_instances(
     mut instance_ids: Vec<String>,
     all: bool,
     region: Option<String>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // If no IDs given and not --all, show interactive menu (always, even for single instance)
     if instance_ids.is_empty() && !all {
         let resolved = resolve_instance_selector_no_auto(None, region.clone()).await?;
@@ -548,8 +542,7 @@ pub async fn stop_instances(
     }
 
     if instance_ids.is_empty() {
-        println!("No instances to terminate.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let req = ec2::TerminateInstancesRequest {
@@ -565,19 +558,15 @@ pub async fn stop_instances(
         eprintln!("Warning: Failed to untrack instances: {}", e);
     }
 
-    for id in &instance_ids {
-        println!("Terminated: {}", id);
-    }
-
-    Ok(())
+    Ok(instance_ids)
 }
 
+/// Get status of instances. Returns list of instance info.
 pub async fn instance_status(
     instance_ids: Vec<String>,
     all: bool,
     region: Option<String>,
-    json: bool,
-) -> Result<()> {
+) -> Result<Vec<InstanceInfo>> {
     // Collect regions to query using HashSet for efficient deduplication
     let mut regions_to_query: HashSet<String> = HashSet::new();
 
@@ -639,50 +628,44 @@ pub async fn instance_status(
         }
     }
 
-    if json {
-        output::print_json(&all_instances)?;
-    } else if all_instances.len() > 1 {
-        // Calculate totals for footer
-        let mut total_rate = 0.0;
-        let mut total_cost = 0.0;
-        let mut total_vcpu: i32 = 0;
-        let mut total_core_secs: u64 = 0;
+    Ok(all_instances)
+}
 
-        for inst in &all_instances {
-            if let Some(rate) = inst.rate.strip_prefix('$') {
-                if let Ok(r) = rate.parse::<f64>() {
-                    total_rate += r;
-                }
+/// Compute status footer values for display.
+/// Returns: [total_label, "", "", "", vcpu, "", "", rate, cost, core_time]
+pub fn status_footer(instances: &[InstanceInfo]) -> Vec<String> {
+    let mut total_rate = 0.0;
+    let mut total_cost = 0.0;
+    let mut total_vcpu: i32 = 0;
+    let mut total_core_secs: u64 = 0;
+
+    for inst in instances {
+        if let Some(rate) = inst.rate.strip_prefix('$') {
+            if let Ok(r) = rate.parse::<f64>() {
+                total_rate += r;
             }
-            if let Some(cost) = inst.cost.strip_prefix('$') {
-                if let Ok(c) = cost.parse::<f64>() {
-                    total_cost += c;
-                }
-            }
-            total_vcpu += inst.vcpu;
-            total_core_secs += inst.running_secs * inst.vcpu as u64;
         }
-
-        // Footer values aligned to columns:
-        // [Instance ID, Name, Type, Arch, vCPU, State, Public IP, Rate/hr, Cost, Running]
-        let footer: Vec<String> = vec![
-            format!("Total: {}", all_instances.len()),
-            String::new(),
-            String::new(),
-            String::new(),
-            total_vcpu.to_string(),
-            String::new(),
-            String::new(),
-            format!("${:.4}", total_rate),
-            format!("${:.4}", total_cost),
-            format_core_time(total_core_secs),
-        ];
-        output::print_table_with_footer(&all_instances, footer);
-    } else {
-        output::print_table(&all_instances);
+        if let Some(cost) = inst.cost.strip_prefix('$') {
+            if let Ok(c) = cost.parse::<f64>() {
+                total_cost += c;
+            }
+        }
+        total_vcpu += inst.vcpu;
+        total_core_secs += inst.running_secs * inst.vcpu as u64;
     }
 
-    Ok(())
+    vec![
+        format!("Total: {}", instances.len()),
+        String::new(),
+        String::new(),
+        String::new(),
+        total_vcpu.to_string(),
+        String::new(),
+        String::new(),
+        format!("${:.4}", total_rate),
+        format!("${:.4}", total_cost),
+        format_core_time(total_core_secs),
+    ]
 }
 
 async fn fetch_current_spot_prices(

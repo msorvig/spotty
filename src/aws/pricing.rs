@@ -8,7 +8,7 @@ use super::client::AwsClients;
 use super::filters::{get_instance_types, InstanceTypeFilter};
 use super::instances::fetch_all_spot_prices;
 use crate::ec2;
-use crate::{output, SortField};
+use crate::SortField;
 
 #[derive(Debug, Serialize, Tabled)]
 pub struct SpotPrice {
@@ -43,13 +43,11 @@ pub async fn list_spot_prices(
     max_price: Option<f64>,
     sort: SortField,
     limit: usize,
-    json: bool,
-) -> Result<()> {
+) -> Result<Vec<SpotPrice>> {
     debug!("Creating AWS clients");
     let clients = AwsClients::new(region)?;
     debug!(region = %clients.region, "Using region");
 
-    eprintln!("Fetching prices...");
     debug!("Fetching instance types and spot prices concurrently");
 
     // If a specific instance type is requested, fetch only that
@@ -136,13 +134,7 @@ pub async fn list_spot_prices(
 
     results.truncate(limit);
 
-    if json {
-        output::print_json(&results)?;
-    } else {
-        output::print_table(&results);
-    }
-
-    Ok(())
+    Ok(results)
 }
 
 /// Fetch spot prices for a specific instance type (optimized single-type query)

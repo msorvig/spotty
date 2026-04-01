@@ -465,7 +465,7 @@ async fn run(cli: Cli) -> Result<()> {
             json,
         } => {
             let arch = filter.arch_str().map(String::from);
-            aws::pricing::list_spot_prices(
+            let results = aws::pricing::list_spot_prices(
                 region,
                 filter.instance_type,
                 filter.vcpu_min,
@@ -476,9 +476,13 @@ async fn run(cli: Cli) -> Result<()> {
                 filter.max_price,
                 sort,
                 limit,
-                json,
             )
             .await?;
+            if json {
+                spotty::output::print_json(&results)?;
+            } else {
+                spotty::output::print_table(&results);
+            }
         }
         Commands::Start {
             filter,
@@ -521,14 +525,26 @@ async fn run(cli: Cli) -> Result<()> {
                 max_tries,
                 volume_size,
             };
-            aws::instances::start_instances(config, number, wait, json).await?;
+            let infos = aws::instances::start_instances(config, number, wait).await?;
+            if json {
+                spotty::output::print_json(&infos)?;
+            } else {
+                spotty::output::print_table(&infos);
+            }
         }
         Commands::Stop {
             instance_ids,
             all,
             region,
         } => {
-            aws::instances::stop_instances(instance_ids, all, region).await?;
+            let terminated = aws::instances::stop_instances(instance_ids, all, region).await?;
+            if terminated.is_empty() {
+                eprintln!("No instances to terminate.");
+            } else {
+                for id in &terminated {
+                    println!("Terminated: {}", id);
+                }
+            }
         }
         Commands::Status {
             instance_ids,
@@ -536,7 +552,15 @@ async fn run(cli: Cli) -> Result<()> {
             region,
             json,
         } => {
-            aws::instances::instance_status(instance_ids, all, region, json).await?;
+            let instances = aws::instances::instance_status(instance_ids, all, region).await?;
+            if json {
+                spotty::output::print_json(&instances)?;
+            } else if instances.len() > 1 {
+                let footer = aws::instances::status_footer(&instances);
+                spotty::output::print_table_with_footer(&instances, footer);
+            } else {
+                spotty::output::print_table(&instances);
+            }
         }
         Commands::Ssh {
             instance_id,
@@ -617,7 +641,7 @@ async fn run(cli: Cli) -> Result<()> {
                 arch,
                 region,
             } => {
-                aws::lambda::deploy_function(LambdaDeployConfig {
+                let func_name = aws::lambda::deploy_function(LambdaDeployConfig {
                     binary_path: binary,
                     name,
                     memory,
@@ -625,6 +649,7 @@ async fn run(cli: Cli) -> Result<()> {
                     arch,
                     region,
                 }).await?;
+                println!("{}", func_name);
             }
             LambdaAction::Start {
                 name,
@@ -632,21 +657,62 @@ async fn run(cli: Cli) -> Result<()> {
                 async_mode,
                 region,
             } => {
-                aws::lambda::invoke_function(name, payload, async_mode, region).await?;
+                let result = aws::lambda::invoke_function(name, payload, async_mode, region).await?;
+                if let Some(ref err) = result.function_error {
+                    eprintln!("Function error: {}", err);
+                }
+                if let Some(payload) = result.payload {
+                    let output = String::from_utf8_lossy(&payload);
+                    println!("{}", output);
+                }
+                if let Some(ref log) = result.log_tail {
+                    if !log.is_empty() {
+                        eprintln!("\n--- Log tail ---\n{}", log);
+                    }
+                }
             }
             LambdaAction::Status { name, region } => {
-                aws::lambda::function_status(name, region).await?;
+                let info = aws::lambda::function_status(name, region).await?;
+                eprintln!("Function: {}", info.name);
+                eprintln!("ARN:      {}", info.arn);
+                eprintln!("Runtime:  {}", info.runtime);
+                eprintln!("Handler:  {}", info.handler);
+                eprintln!("Memory:   {}", info.memory);
+                eprintln!("Timeout:  {}", info.timeout);
+                eprintln!("Arch:     {}", info.arch);
+                eprintln!("Size:     {} bytes", info.code_size);
+                eprintln!("Modified: {}", info.last_modified);
+                eprintln!("State:    {}", info.state);
             }
             LambdaAction::List { region, json } => {
-                aws::lambda::list_functions(region, json).await?;
+                let funcs = aws::lambda::list_functions(region).await?;
+                if json {
+                    spotty::output::print_json(&funcs)?;
+                } else if funcs.is_empty() {
+                    eprintln!("No spotty-managed Lambda functions found.");
+                } else {
+                    spotty::output::print_table(&funcs);
+                }
             }
             LambdaAction::Stop { names, all, region } => {
-                aws::lambda::delete_functions(names, all, region).await?;
+                let deleted = aws::lambda::delete_functions(names, all, region).await?;
+                if deleted.is_empty() {
+                    eprintln!("No functions to delete.");
+                } else {
+                    for name in &deleted {
+                        println!("Deleted: {}", name);
+                    }
+                }
             }
         },
         Commands::Image { action } => match action {
             ImageAction::List { region, json } => {
-                aws::images::list_images(region, json).await?;
+                let images = aws::images::list_images(region).await?;
+                if json {
+                    spotty::output::print_json(&images)?;
+                } else {
+                    spotty::output::print_table(&images);
+                }
             }
             ImageAction::Create {
                 instance_id,
@@ -660,7 +726,8 @@ async fn run(cli: Cli) -> Result<()> {
                 let id = resolved.ok_or_else(|| {
                     anyhow::anyhow!("No running instances found. Provide an instance ID.")
                 })?;
-                aws::images::create_image(id, name, no_reboot, wait, region).await?;
+                let ami_id = aws::images::create_image(id, name, no_reboot, wait, region).await?;
+                println!("{}", ami_id);
             }
             ImageAction::Rm { ami_id, region } => {
                 aws::images::remove_image(ami_id, region).await?;
