@@ -1,6 +1,6 @@
 # Spotty
 
-A command-line tool for managing AWS EC2 spot instances. Query spot prices, launch instances, and SSH in - all from your terminal.
+A command-line tool for managing AWS EC2 spot instances. Query spot prices, launch instances, deploy files, build custom AMIs, and SSH in - all from your terminal.
 
 ## Installation
 
@@ -57,6 +57,11 @@ Your IAM user/role needs these permissions:
         "ec2:DescribeVpcs",
         "ec2:DescribeKeyPairs",
         "ec2:CreateKeyPair",
+        "ec2:CreateImage",
+        "ec2:DeregisterImage",
+        "ec2:DescribeImages",
+        "ec2:DescribeSnapshots",
+        "ec2:DeleteSnapshot",
         "ssm:GetParameter"
       ],
       "Resource": "*"
@@ -65,7 +70,7 @@ Your IAM user/role needs these permissions:
 }
 ```
 
-For `spotty watch setup`, you also need IAM permissions (one-time setup):
+For `spotty watch setup` (macOS only), you also need IAM permissions (one-time setup):
 
 ```json
 {
@@ -110,7 +115,7 @@ spotty keys create my-key
 ### 2. Find Cheap Spot Instances
 
 ```bash
-# List cheapest instances (shows price/hr and ¢/core/hr)
+# List cheapest instances (shows price/hr and c/core/hr)
 spotty prices --limit 10
 
 # Filter by specs
@@ -140,6 +145,9 @@ spotty start --vcpu-min 4 --number 3
 
 # With specific key and custom AMI
 spotty start --instance-type t3.large --ami ami-0123456789abcdef0 --key-name my-key
+
+# Custom root volume size
+spotty start --instance-type t3.medium --volume-size 50
 ```
 
 ### 4. Check Status
@@ -176,7 +184,28 @@ spotty ssh i-0123456789abcdef0 --key ~/.ssh/other-key.pem
 spotty ssh --vcpu-min 2 --memory-min 4 --arch arm64
 ```
 
-### 6. Terminate Instances
+### 6. Deploy Files
+
+Upload local files to a running instance via SCP:
+
+```bash
+# Deploy a binary (auto-selects instance if only one running)
+spotty deploy ./target/release/myapp
+
+# Deploy to a specific directory
+spotty deploy ./myapp --to /usr/local/bin
+
+# Deploy and run a command after
+spotty deploy ./myapp --run "chmod +x ~/myapp && ~/myapp --version"
+
+# Deploy multiple files
+spotty deploy ./myapp ./config.toml --to ~/app
+
+# Deploy to a specific instance
+spotty deploy ./myapp --instance i-0123456789abcdef0
+```
+
+### 7. Terminate Instances
 
 ```bash
 # Single instance
@@ -187,6 +216,76 @@ spotty stop i-abc123 i-def456 i-ghi789
 
 # Terminate all spotty-managed instances
 spotty stop --all
+```
+
+## Custom AMI Images
+
+### List Available AMIs
+
+```bash
+# Shows base AL2023 AMIs and any custom AMIs from config
+spotty image list
+```
+
+### Build a Custom AMI from a Script
+
+Launch an instance, run a build script on it, and bake the result into an AMI:
+
+```bash
+# Build with a script (launches instance, runs script, bakes AMI, terminates)
+spotty image build --script setup.sh --arch arm64
+
+# With a custom name and volume size
+spotty image build --script setup.sh --name "my-app-v1" --volume-size 40
+```
+
+### Build a Custom AMI with a Deployed Binary
+
+Cross-compile locally, deploy to an instance, and bake:
+
+```bash
+# 1. Launch an instance
+spotty start --arch x86_64 --wait
+
+# 2. Cross-compile your Rust binary
+cargo build --release --target x86_64-unknown-linux-gnu
+
+# 3. Deploy the binary and any config files
+spotty deploy ./target/x86_64-unknown-linux-gnu/release/myapp ./config.toml \
+  --to ~/app --run "chmod +x ~/app/myapp"
+
+# 4. Bake the instance into an AMI
+spotty image create --wait --name "myapp-v1"
+
+# 5. Terminate the builder instance
+spotty stop --all
+```
+
+### Create an AMI from a Running Instance
+
+```bash
+# Bake current state into an AMI
+spotty image create --wait
+
+# With a custom name
+spotty image create i-0123456789abcdef0 --name "my-snapshot" --wait
+```
+
+### Remove an AMI
+
+```bash
+# Deregister AMI and delete backing snapshots
+spotty image rm ami-0123456789abcdef0
+```
+
+### Launch from a Custom AMI
+
+```bash
+# Use a specific AMI
+spotty start --ami ami-0123456789abcdef0
+
+# Or configure a default in config.toml:
+spotty config set ami.us-east-1-x86_64 ami-0123456789abcdef0
 ```
 
 ## Configuration Reference
@@ -227,10 +326,6 @@ spotty keys create my-key
 # List available key pairs
 spotty keys list
 # Shows: NAME, TYPE, LOCAL FILE (whether private key exists locally)
-
-# Or use AWS CLI directly
-aws ec2 create-key-pair --key-name spotty-key --query 'KeyMaterial' --output text > ~/.ssh/spotty-key.pem
-chmod 400 ~/.ssh/spotty-key.pem
 ```
 
 ### Finding the Right Instance Type
@@ -268,27 +363,7 @@ Host spotty-*
     UserKnownHostsFile /dev/null
 ```
 
-## Troubleshooting
-
-### "No credentials found"
-
-Ensure AWS credentials are configured:
-```bash
-aws sts get-caller-identity
-```
-
-### "Instance has no public IP"
-
-The instance may be in a private subnet or still starting. Check status:
-```bash
-spotty status i-xxxxx
-```
-
-### "SSH connection refused"
-
-Wait for the instance to fully boot (use `--wait` flag), or check security group allows SSH (port 22).
-
-## Auto-Cleanup Watcher
+## Auto-Cleanup Watcher (macOS)
 
 Spotty includes a watcher daemon that automatically terminates instances when your Mac goes to sleep (to avoid forgotten instances accumulating costs).
 
@@ -318,19 +393,30 @@ The `spotty watch setup` command creates a dedicated IAM user (`spotty-watcher`)
 - `ec2:DescribeInstances` - to find running instances
 - `ec2:TerminateInstances` - only for instances tagged with `ManagedBy=spotty`
 
-This ensures the watcher daemon can only terminate spotty-managed instances, even if credentials are compromised.
-
-The setup command:
-1. Creates IAM user `spotty-watcher`
-2. Attaches a minimal permissions policy
-3. Creates access keys
-4. Stores credentials in `~/.aws/credentials` under `[spotty-watcher]` profile
-5. Configures the launchd agent to use this profile
-
 Use `--no-auto-cleanup` when starting instances to exclude them from auto-cleanup:
 ```bash
 spotty start --instance-type t3.micro --no-auto-cleanup
 ```
+
+## Troubleshooting
+
+### "No credentials found"
+
+Ensure AWS credentials are configured:
+```bash
+aws sts get-caller-identity
+```
+
+### "Instance has no public IP"
+
+The instance may be in a private subnet or still starting. Check status:
+```bash
+spotty status i-xxxxx
+```
+
+### "SSH connection refused"
+
+Wait for the instance to fully boot (use `--wait` flag), or check security group allows SSH (port 22).
 
 ## Debugging
 
@@ -343,4 +429,4 @@ spotty -t start --instance-type t3.micro
 
 ## License
 
-MIT
+CC0 1.0 Universal

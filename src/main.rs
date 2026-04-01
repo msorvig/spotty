@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use spotty::aws::instances::LaunchConfig;
-use spotty::{aws, config, keys, launchd, ssh, watch, InstanceFilterArgs, SortField};
+use spotty::{aws, config, keys, ssh, InstanceFilterArgs, SortField};
+#[cfg(target_os = "macos")]
+use spotty::{launchd, watch};
 
 #[derive(Parser)]
 #[command(name = "spotty")]
@@ -154,6 +156,37 @@ enum Commands {
         no_auto_cleanup: bool,
     },
 
+    /// Deploy local files to a running instance via SCP
+    Deploy {
+        /// Local file(s) to upload
+        #[arg(required = true)]
+        files: Vec<String>,
+
+        /// Instance ID (auto-selects if only one running)
+        #[arg(long, short)]
+        instance: Option<String>,
+
+        /// Remote directory (default: ~)
+        #[arg(long, short, default_value = "~")]
+        to: String,
+
+        /// Run command after deploying
+        #[arg(long, short)]
+        run: Option<String>,
+
+        /// Path to SSH private key
+        #[arg(long, short)]
+        key: Option<String>,
+
+        /// SSH user
+        #[arg(long, short, default_value = "ec2-user")]
+        user: String,
+
+        /// AWS region
+        #[arg(long)]
+        region: Option<String>,
+    },
+
     /// Manage configuration
     Config {
         #[command(subcommand)]
@@ -166,7 +199,8 @@ enum Commands {
         action: KeysAction,
     },
 
-    /// Manage the auto-cleanup watcher daemon
+    /// Manage the auto-cleanup watcher daemon (macOS only)
+    #[cfg(target_os = "macos")]
     Watch {
         #[command(subcommand)]
         action: Option<WatchAction>,
@@ -278,6 +312,7 @@ enum ImageAction {
     },
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Subcommand)]
 enum WatchAction {
     /// Install the launchd agent (auto-start on login)
@@ -375,7 +410,8 @@ async fn run(cli: Cli) -> Result<()> {
             max_tries,
             volume_size,
         } => {
-            // Auto-install the watcher agent on first start
+            // Auto-install the watcher agent on first start (macOS only)
+            #[cfg(target_os = "macos")]
             if !no_auto_cleanup {
                 let _ = launchd::ensure_installed();
             }
@@ -437,7 +473,8 @@ async fn run(cli: Cli) -> Result<()> {
                     anyhow::bail!("No running instances. Provide filters (--vcpu-min, --memory-min, --arch, etc.) to start a new instance");
                 }
 
-                // Auto-install watcher
+                // Auto-install watcher (macOS only)
+                #[cfg(target_os = "macos")]
                 if !no_auto_cleanup {
                     let _ = launchd::ensure_installed();
                 }
@@ -461,6 +498,21 @@ async fn run(cli: Cli) -> Result<()> {
             };
 
             ssh::ssh_into_instance(target_instance_id, key, user, command, region).await?;
+        }
+        Commands::Deploy {
+            files,
+            instance,
+            to,
+            run,
+            key,
+            user,
+            region,
+        } => {
+            let resolved = aws::instances::resolve_instance_selector(instance, region.clone()).await?;
+            let instance_id = resolved.ok_or_else(|| {
+                anyhow::anyhow!("No running instances found. Provide --instance or start one first.")
+            })?;
+            ssh::deploy_to_instance(instance_id, files, to, key, user, run, region).await?;
         }
         Commands::Config { action } => match action {
             ConfigAction::Show => config::show_config()?,
@@ -516,6 +568,7 @@ async fn run(cli: Cli) -> Result<()> {
                 aws::images::build_image(script, name, volume_size, region, launch_config).await?;
             }
         },
+        #[cfg(target_os = "macos")]
         Commands::Watch { action } => match action {
             Some(WatchAction::Install) => launchd::install()?,
             Some(WatchAction::Uninstall) => launchd::uninstall()?,

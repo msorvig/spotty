@@ -98,6 +98,93 @@ pub async fn wait_for_ssh(ip: &str, user: &str, key_path: Option<&str>) -> Resul
 }
 
 
+/// Deploy local files to a running instance via SCP, optionally run a command.
+pub async fn deploy_to_instance(
+    instance_id: String,
+    local_paths: Vec<String>,
+    remote_dir: String,
+    key: Option<String>,
+    user: String,
+    command: Option<String>,
+    region: Option<String>,
+) -> Result<()> {
+    let clients = AwsClients::new(region)?;
+    let config = Config::load()?;
+
+    let ip = get_instance_public_ip(&clients, &instance_id).await?;
+
+    let key_path = if let Some(k) = key {
+        Some(expand_tilde(&k).into_owned())
+    } else if let Some(ref k) = config.defaults.key_path {
+        Some(expand_tilde(k).into_owned())
+    } else {
+        let key_name = get_instance_key_name(&clients, &instance_id).await?;
+        find_key_file(&key_name)
+    };
+
+    // Wait for SSH to be ready
+    wait_for_ssh(&ip, &user, key_path.as_deref()).await?;
+
+    // Ensure remote directory exists
+    let mut mkdir_cmd = Command::new("ssh");
+    if let Some(ref kp) = key_path {
+        mkdir_cmd.arg("-i").arg(kp);
+    }
+    add_ssh_options(&mut mkdir_cmd);
+    mkdir_cmd
+        .arg(format!("{}@{}", user, ip))
+        .arg(format!("mkdir -p {}", remote_dir));
+    let status = mkdir_cmd.status()?;
+    if !status.success() {
+        bail!("Failed to create remote directory: {}", remote_dir);
+    }
+
+    // SCP each file
+    for local_path in &local_paths {
+        let path = std::path::Path::new(local_path);
+        if !path.exists() {
+            bail!("Local file not found: {}", local_path);
+        }
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let target = format!("{}@{}:{}/{}", user, ip, remote_dir, filename);
+        eprintln!("Uploading {} -> {}:{}/{}", local_path, instance_id, remote_dir, filename);
+
+        let mut scp_cmd = Command::new("scp");
+        if let Some(ref kp) = key_path {
+            scp_cmd.arg("-i").arg(kp);
+        }
+        add_ssh_options(&mut scp_cmd);
+        scp_cmd.arg(local_path).arg(&target);
+
+        let status = scp_cmd.status()?;
+        if !status.success() {
+            bail!("SCP failed for {}", local_path);
+        }
+    }
+
+    eprintln!("Deployed {} file(s) to {}:{}", local_paths.len(), instance_id, remote_dir);
+
+    // Optionally run a command
+    if let Some(cmd) = command {
+        eprintln!("Running: {}", cmd);
+        let mut ssh_cmd = Command::new("ssh");
+        if let Some(ref kp) = key_path {
+            ssh_cmd.arg("-i").arg(kp);
+        }
+        add_ssh_options(&mut ssh_cmd);
+        ssh_cmd
+            .arg(format!("{}@{}", user, ip))
+            .arg(&cmd);
+
+        let status = ssh_cmd.status()?;
+        if !status.success() {
+            bail!("Remote command failed with status: {:?}", status.code());
+        }
+    }
+
+    Ok(())
+}
+
 fn find_key_file(key_name: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let ssh_dir = PathBuf::from(&home).join(".ssh");

@@ -1,6 +1,22 @@
-//! Spotty - AWS EC2 Spot Instance library
+//! Spotty - AWS EC2 Spot Instance management library
 //!
-//! This library provides APIs for managing AWS EC2 spot instances.
+//! Provides APIs for managing AWS EC2 spot instances: querying prices,
+//! launching and terminating instances, SSH access, file deployment,
+//! and AMI image management.
+//!
+//! # Modules
+//!
+//! - [`aws`] - AWS API operations (instances, pricing, images, client setup)
+//! - [`config`] - Configuration file management (`~/.config/spotty/config.toml`)
+//! - [`keys`] - SSH key pair creation and listing
+//! - [`ssh`] - SSH connections and file deployment via SCP
+//! - [`state`] - Local instance tracking (`~/.cache/spotty/instances.json`)
+//! - [`output`] - Table and JSON output formatting
+//! - [`utils`] - Shared utilities (base64, tilde expansion, SSH options)
+//!
+//! On macOS, additional modules are available:
+//! - `launchd` - launchd agent management for the auto-cleanup watcher
+//! - `watch` - Sleep/wake detection for automatic instance cleanup
 
 #[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
 pub mod ec2 {
@@ -26,11 +42,13 @@ pub mod iam {
 pub mod aws;
 pub mod config;
 pub mod keys;
+#[cfg(target_os = "macos")]
 pub mod launchd;
 pub mod output;
 pub mod ssh;
 pub mod state;
 pub mod utils;
+#[cfg(target_os = "macos")]
 pub mod watch;
 
 use clap::Args;
