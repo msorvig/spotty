@@ -47,6 +47,38 @@ fn main() {
             "ListAccessKeys",
             "DeleteAccessKey",
             "CreateAccessKey",
+            "CreateRole",
+            "GetRole",
+            "AttachRolePolicy",
+        ],
+        sync: false,
+    }.generate();
+
+    GenerateSpec {
+        name:          "lambda",
+        protocol:      Protocol::RestJson,
+        runtime_crate: "aws_runtime_async",
+        operations:    &[
+            "CreateFunction",
+            "DeleteFunction",
+            "GetFunction",
+            "GetFunctionConfiguration",
+            "Invoke",
+            "ListFunctions",
+            "UpdateFunctionCode",
+            "UpdateFunctionConfiguration",
+            "TagResource",
+            "ListTags",
+        ],
+        sync: false,
+    }.generate();
+
+    GenerateSpec {
+        name:          "sts",
+        protocol:      Protocol::Query,
+        runtime_crate: "aws_runtime_async",
+        operations:    &[
+            "GetCallerIdentity",
         ],
         sync: false,
     }.generate();

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use spotty::aws::instances::LaunchConfig;
+use spotty::aws::lambda::LambdaDeployConfig;
 use spotty::{aws, config, keys, ssh, InstanceFilterArgs, SortField};
 #[cfg(target_os = "macos")]
 use spotty::{launchd, watch};
@@ -206,6 +207,12 @@ enum Commands {
         action: Option<WatchAction>,
     },
 
+    /// Run workloads on AWS Lambda
+    Lambda {
+        #[command(subcommand)]
+        action: LambdaAction,
+    },
+
     /// Manage AMI images (list base AMIs, create custom images)
     Image {
         #[command(subcommand)]
@@ -305,6 +312,84 @@ enum ImageAction {
         /// Root volume size in GB (default: 20)
         #[arg(long)]
         volume_size: Option<i32>,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LambdaAction {
+    /// Deploy a binary as a Lambda function
+    Deploy {
+        /// Path to compiled binary
+        binary: String,
+
+        /// Function name (default: spotty-<binary-name>)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Memory in MB
+        #[arg(long, short, default_value = "128")]
+        memory: i32,
+
+        /// Timeout in seconds (max 900)
+        #[arg(long, default_value = "900")]
+        timeout: i32,
+
+        /// Architecture: x86_64, arm64
+        #[arg(long, short)]
+        arch: Option<String>,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
+    /// Invoke a Lambda function
+    Start {
+        /// Function name
+        name: String,
+
+        /// JSON payload
+        #[arg(long, short)]
+        payload: Option<String>,
+
+        /// Fire-and-forget (don't wait for result)
+        #[arg(long, name = "async")]
+        async_mode: bool,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
+    /// Show function details
+    Status {
+        /// Function name
+        name: String,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
+    /// List spotty-managed Lambda functions
+    List {
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete Lambda function(s)
+    Stop {
+        /// Function name(s)
+        names: Vec<String>,
+
+        /// Delete all spotty-managed functions
+        #[arg(long, short)]
+        all: bool,
 
         /// AWS region
         #[arg(long, short)]
@@ -522,6 +607,42 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Keys { action } => match action {
             KeysAction::Create { name, region } => keys::create_key_pair(&name, region).await?,
             KeysAction::List { region } => keys::list_key_pairs(region).await?,
+        },
+        Commands::Lambda { action } => match action {
+            LambdaAction::Deploy {
+                binary,
+                name,
+                memory,
+                timeout,
+                arch,
+                region,
+            } => {
+                aws::lambda::deploy_function(LambdaDeployConfig {
+                    binary_path: binary,
+                    name,
+                    memory,
+                    timeout,
+                    arch,
+                    region,
+                }).await?;
+            }
+            LambdaAction::Start {
+                name,
+                payload,
+                async_mode,
+                region,
+            } => {
+                aws::lambda::invoke_function(name, payload, async_mode, region).await?;
+            }
+            LambdaAction::Status { name, region } => {
+                aws::lambda::function_status(name, region).await?;
+            }
+            LambdaAction::List { region, json } => {
+                aws::lambda::list_functions(region, json).await?;
+            }
+            LambdaAction::Stop { names, all, region } => {
+                aws::lambda::delete_functions(names, all, region).await?;
+            }
         },
         Commands::Image { action } => match action {
             ImageAction::List { region, json } => {

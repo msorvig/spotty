@@ -39,6 +39,16 @@ pub mod iam {
     include!(concat!(env!("OUT_DIR"), "/iam.rs"));
 }
 
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod lambda_api {
+    include!(concat!(env!("OUT_DIR"), "/lambda.rs"));
+}
+
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod sts {
+    include!(concat!(env!("OUT_DIR"), "/sts.rs"));
+}
+
 pub mod aws;
 pub mod config;
 pub mod keys;
