@@ -1,12 +1,18 @@
-//! Spotty - AWS EC2 Spot Instance management library
+//! Spotty - AWS compute management library
 //!
-//! Provides APIs for managing AWS EC2 spot instances: querying prices,
-//! launching and terminating instances, SSH access, file deployment,
-//! and AMI image management.
+//! Provides APIs for running workloads on AWS using EC2 spot instances
+//! and Lambda functions. Supports querying prices, launching and
+//! terminating instances, SSH access, file deployment, AMI image
+//! management, and Lambda function lifecycle.
 //!
 //! # Modules
 //!
-//! - [`aws`] - AWS API operations (instances, pricing, images, client setup)
+//! - [`aws`] - AWS API operations:
+//!   - [`aws::instances`] - EC2 spot instance lifecycle
+//!   - [`aws::pricing`] - Spot price queries
+//!   - [`aws::images`] - AMI image management
+//!   - [`aws::lambda`] - Lambda function deployment and invocation
+//!   - [`aws::client`] - AWS client setup
 //! - [`config`] - Configuration file management (`~/.config/spotty/config.toml`)
 //! - [`keys`] - SSH key pair creation and listing
 //! - [`ssh`] - SSH connections and file deployment via SCP

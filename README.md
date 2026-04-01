@@ -1,6 +1,6 @@
 # Spotty
 
-A command-line tool for managing AWS EC2 spot instances. Query spot prices, launch instances, deploy files, build custom AMIs, and SSH in - all from your terminal.
+A command-line tool for running workloads on AWS. Supports EC2 spot instances (long-running, SSH access) and Lambda functions (up to 15 min, serverless). Deploy custom binaries, build AMIs, and manage compute from your terminal.
 
 ## Installation
 
@@ -62,7 +62,22 @@ Your IAM user/role needs these permissions:
         "ec2:DescribeImages",
         "ec2:DescribeSnapshots",
         "ec2:DeleteSnapshot",
-        "ssm:GetParameter"
+        "ssm:GetParameter",
+        "lambda:CreateFunction",
+        "lambda:DeleteFunction",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:InvokeFunction",
+        "lambda:ListFunctions",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:TagResource",
+        "lambda:ListTags",
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:AttachRolePolicy",
+        "iam:PassRole",
+        "sts:GetCallerIdentity"
       ],
       "Resource": "*"
     }
@@ -287,6 +302,70 @@ spotty start --ami ami-0123456789abcdef0
 # Or configure a default in config.toml:
 spotty config set ami.us-east-1-x86_64 ami-0123456789abcdef0
 ```
+
+## Lambda Functions
+
+Lambda provides a serverless compute backend for short jobs (up to 15 minutes). Deploy a compiled binary and invoke it without managing instances.
+
+### Deploy a Binary
+
+```bash
+# Cross-compile for Lambda (Amazon Linux 2023)
+cargo build --release --target x86_64-unknown-linux-gnu
+
+# Deploy as a Lambda function (auto-named spotty-<binary>)
+spotty lambda deploy ./target/x86_64-unknown-linux-gnu/release/myapp
+
+# With custom settings
+spotty lambda deploy ./myapp --name my-service --memory 256 --timeout 300 --arch arm64
+```
+
+The binary is packaged as `bootstrap` in a zip and deployed with the `provided.al2023` custom runtime. An IAM execution role (`spotty-lambda-execution`) is auto-created on first deploy.
+
+### Start (Invoke)
+
+```bash
+# Invoke and wait for result
+spotty lambda start my-service
+
+# With JSON payload
+spotty lambda start my-service --payload '{"input": "data"}'
+
+# Fire-and-forget
+spotty lambda start my-service --async
+```
+
+### List and Status
+
+```bash
+# List all spotty-managed functions
+spotty lambda list
+
+# Show details for a specific function
+spotty lambda status my-service
+```
+
+### Stop (Delete)
+
+```bash
+# Delete a function
+spotty lambda stop my-service
+
+# Delete all spotty-managed functions
+spotty lambda stop --all
+```
+
+### EC2 vs Lambda
+
+| | EC2 Spot | Lambda |
+|---|---|---|
+| Duration | Unlimited | Up to 15 min |
+| Access | SSH, SCP | API invoke only |
+| Binary delivery | `spotty deploy` (SCP) | `spotty lambda deploy` (zip) |
+| Start | `spotty start` | `spotty lambda start` |
+| Custom images | AMI (`spotty image build`) | Container (planned) |
+| Cost | Per-hour while running | Per-invocation |
+| Cleanup needed | Yes | No (no idle cost) |
 
 ## Configuration Reference
 
