@@ -1,0 +1,23 @@
+[package]
+name = "iroh-comm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "service"
+path = "src/bin/service.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[dependencies]
+iroh = "0.97"
+iroh-relay = { version = "0.97", features = ["server"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
