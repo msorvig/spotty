@@ -98,6 +98,44 @@ pub async fn wait_for_ssh(ip: &str, user: &str, key_path: Option<&str>) -> Resul
 }
 
 
+/// Run a command on an instance via SSH, capturing stdout.
+pub async fn run_command(
+    instance_id: &str,
+    command: &str,
+    region: Option<String>,
+) -> Result<String> {
+    let clients = AwsClients::new(region)?;
+    let config = Config::load()?;
+
+    let ip = get_instance_public_ip(&clients, instance_id).await?;
+
+    let key_path = if let Some(ref k) = config.defaults.key_path {
+        Some(expand_tilde(k).into_owned())
+    } else {
+        let key_name = get_instance_key_name(&clients, instance_id).await?;
+        find_key_file(&key_name)
+    };
+
+    let user = config.defaults.ssh_user.as_deref().unwrap_or("ec2-user");
+
+    wait_for_ssh(&ip, user, key_path.as_deref()).await?;
+
+    let mut ssh_cmd = Command::new("ssh");
+    if let Some(ref kp) = key_path {
+        ssh_cmd.arg("-i").arg(kp);
+    }
+    add_ssh_options(&mut ssh_cmd);
+    ssh_cmd.arg(format!("{}@{}", user, ip)).arg(command);
+
+    let output = ssh_cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("SSH command failed: {}", stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Deploy local files to a running instance via SCP, optionally run a command.
 pub async fn deploy_to_instance(
     instance_id: String,
