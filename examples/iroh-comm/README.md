@@ -43,8 +43,9 @@ cargo build --release --target x86_64-unknown-linux-gnu
 ### EC2: relay + service on one instance
 
 ```bash
-# Launch an instance
+# Launch an instance and open the relay port
 spotty start --arch x86_64 --wait
+spotty open-port 3340
 
 # Deploy relay and service
 spotty deploy \
@@ -53,8 +54,11 @@ spotty deploy \
   --to ~/app \
   --run "chmod +x ~/app/relay ~/app/service"
 
-# SSH in and start the relay (note the public IP from spotty status)
-spotty ssh -c "~/app/relay --port 3340 &"
+# Get the public IP
+spotty status
+
+# SSH in and start the relay
+spotty ssh -c "nohup ~/app/relay --port 3340 > /tmp/relay.log 2>&1 &"
 
 # Start the service (it prints its node ID)
 spotty ssh -c "~/app/service --relay http://<PUBLIC_IP>:3340"
@@ -63,8 +67,9 @@ spotty ssh -c "~/app/service --relay http://<PUBLIC_IP>:3340"
 ### Lambda: relay on EC2, service on Lambda
 
 ```bash
-# Launch a small relay instance
+# Launch a small relay instance and open the port
 spotty start --instance-type t3.micro --wait --name relay
+spotty open-port 3340
 
 # Deploy and start the relay
 spotty deploy target/x86_64-unknown-linux-gnu/release/relay --to ~/app \
@@ -93,3 +98,7 @@ cargo run --bin client -- \
 All traffic between client and service is end-to-end encrypted by iroh
 (QUIC/TLS). The relay cannot read the content — it only routes encrypted
 packets. Endpoints are authenticated by Ed25519 public keys.
+
+The relay port (3340) is opened on the EC2 security group via
+`spotty open-port`. Only the relay needs an open port — the service and
+client both make outbound connections to it.

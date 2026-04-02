@@ -771,6 +771,31 @@ async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<Strin
     Ok(ami.to_string())
 }
 
+/// Open a TCP port on the spotty-default security group.
+/// Idempotent — silently succeeds if the rule already exists.
+pub async fn open_port(port: u16, region: Option<String>) -> Result<()> {
+    let clients = AwsClients::new(region)?;
+    let sg_id = ensure_default_security_group(&clients).await?;
+
+    match ec2::authorize_security_group_ingress(
+        &clients.client,
+        ec2::AuthorizeSecurityGroupIngressRequest::default()
+            .group_id(sg_id)
+            .ip_protocol("tcp")
+            .from_port(port as i32)
+            .to_port(port as i32)
+            .cidr_ip("0.0.0.0/0"),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(AwsError::AwsService { ref code, .. }) if code == "InvalidPermission.Duplicate" => {
+            Ok(()) // already open
+        }
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
+}
+
 async fn ensure_default_security_group(clients: &AwsClients) -> Result<String> {
     // Check if spotty-default exists
     let resp = ec2::describe_security_groups(

@@ -96,6 +96,16 @@ enum Commands {
         volume_size: Option<i32>,
     },
 
+    /// Open a TCP port on the spotty security group
+    OpenPort {
+        /// Port number to open
+        port: u16,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
+
     /// Terminate spot instances
     Stop {
         /// Instance IDs to terminate (or use --all)
@@ -531,6 +541,10 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 spotty::output::print_table(&infos);
             }
+        }
+        Commands::OpenPort { port, region } => {
+            aws::instances::open_port(port, region).await?;
+            eprintln!("Port {} open.", port);
         }
         Commands::Stop {
             instance_ids,
