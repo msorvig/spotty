@@ -29,10 +29,11 @@ The client handles all infrastructure setup programmatically:
 
 ## Build
 
-Cross-compile the relay and service for Linux:
+Cross-compile the relay and service for Linux (requires
+[zig](https://ziglang.org/) and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)):
 
 ```bash
-cargo build --release --target x86_64-unknown-linux-gnu
+cargo zigbuild --release --target x86_64-unknown-linux-gnu
 ```
 
 Build the client for your local machine:
