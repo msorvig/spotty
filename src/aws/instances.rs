@@ -729,17 +729,30 @@ async fn discover_key_pair(clients: &AwsClients) -> Result<String> {
         .filter_map(|k| k.key_name.as_deref())
         .collect();
 
-    match keys.len() {
-        0 => bail!("No SSH key pairs found. Create one with: aws ec2 create-key-pair --key-name <name>"),
-        1 => {
-            eprintln!("Using key: {}", keys[0]);
-            Ok(keys[0].to_string())
-        }
-        _ => {
-            eprintln!("Using key: {} (of {} available)", keys[0], keys.len());
-            Ok(keys[0].to_string())
-        }
+    if keys.is_empty() {
+        bail!("No SSH key pairs found. Run `spotty setup`, or create one with: spotty keys create <name>");
     }
+
+    // Prefer a key pair whose private key is on this machine. `spotty setup`
+    // names its key pair after the host, so an account used from several
+    // machines has several, and picking the first would launch an instance
+    // nobody here can SSH into.
+    if let Some(usable) = keys.iter().find(|k| crate::ssh::find_key_file(k).is_some()) {
+        if keys.len() > 1 {
+            eprintln!("Using key: {} (of {} available)", usable, keys.len());
+        } else {
+            eprintln!("Using key: {usable}");
+        }
+        return Ok(usable.to_string());
+    }
+
+    eprintln!(
+        "Warning: no private key in ~/.ssh for any of the {} key pair(s) in this account; \
+         using '{}' — you may not be able to SSH in.",
+        keys.len(),
+        keys[0]
+    );
+    Ok(keys[0].to_string())
 }
 
 async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<String> {

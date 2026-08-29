@@ -251,7 +251,10 @@ async fn assume_with_retry(region: Option<String>) -> Result<AwsClients> {
 
 /// Create an SSH key pair if the account has none that spotty can use.
 async fn ensure_key_pair(clients: &AwsClients, role_name: &str) -> Result<Option<(String, String)>> {
-    let key_name = format!("{role_name}-key");
+    let key_name = match short_hostname() {
+        Some(host) => format!("{role_name}-key-{host}"),
+        None => format!("{role_name}-key"),
+    };
 
     let existing = ec2::describe_key_pairs(
         &clients.client,
@@ -669,6 +672,30 @@ fn permission_policy(account_id: &str) -> String {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// This machine's short hostname, reduced to characters that read well in a
+/// key-pair name. `None` when the hostname cannot be determined.
+///
+/// Key pairs are named per machine because AWS only hands out the private key
+/// once, at creation: a single shared name means whichever machine ran `setup`
+/// second has a key pair it cannot use.
+fn short_hostname() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let sanitized: String = raw
+        .trim()
+        // Strip the domain: `tink.local` and `tink` are the same machine.
+        .split('.')
+        .next()?
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    Some(sanitized).filter(|s| !s.is_empty())
+}
+
 fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -748,6 +775,16 @@ mod tests {
         let policy = permission_policy("123456789012");
         assert!(policy.contains("arn:aws:lambda:*:123456789012:function:spotty-*"));
         assert!(!policy.contains("\"lambda:*\""));
+    }
+
+    #[test]
+    fn hostname_is_usable_in_a_key_name() {
+        // Whatever this machine is called, the result has to be a legal,
+        // readable key-pair name — no dots, spaces or case surprises.
+        if let Some(h) = short_hostname() {
+            assert!(!h.is_empty());
+            assert!(h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'), "{h}");
+        }
     }
 
     #[test]

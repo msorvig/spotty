@@ -8,7 +8,7 @@ use super::client::AwsClients;
 use super::instances::{self, LaunchConfig};
 use crate::config::Config;
 use crate::ec2;
-use crate::ssh;
+use crate::ssh::{self, find_key_file};
 use crate::utils::{add_ssh_options, expand_tilde};
 
 #[derive(Debug, Serialize, Tabled)]
@@ -482,22 +482,6 @@ async fn build_image_inner(
 }
 
 /// Find an SSH key file in ~/.ssh/ by key name.
-fn find_key_file(key_name: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let ssh_dir = std::path::PathBuf::from(&home).join(".ssh");
-    let candidates = [
-        ssh_dir.join(format!("{}.pem", key_name)),
-        ssh_dir.join(key_name),
-        ssh_dir.join(format!("{}.key", key_name)),
-    ];
-    for path in &candidates {
-        if path.exists() {
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
 /// Poll DescribeImages until the image is available.
 async fn wait_for_image_available(clients: &AwsClients, ami_id: &str) -> Result<()> {
     loop {

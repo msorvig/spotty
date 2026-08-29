@@ -207,14 +207,36 @@ role_arn = "arn:aws:iam::123456789012:role/spotty"   # written by `spotty setup`
 ssh_user = "ec2-user"
 
 [regions.eu-north-1]
-key_name = "spotty-key"          # Name of your EC2 key pair
-key_path = "~/.ssh/spotty-key.pem"
+key_name = "spotty-key-tink"     # Name of your EC2 key pair
+key_path = "~/.ssh/spotty-key-tink.pem"
 security_group = "sg-0123456789abcdef0"
 ```
 
 Key pairs and security groups exist inside a single region, so `setup` records
 them under `[regions.<name>]`. Running `spotty setup --region <other>` adds a
-second block rather than overwriting the first.
+second block rather than overwriting the first. Values you set under
+`[defaults]` fill in whatever a region block leaves out, but only in the region
+`defaults.region` names — a `sg-...` from one region is meaningless in another.
+
+### Using spotty from more than one machine
+
+AWS hands out a key pair's private key exactly once, when it is created, so a
+key pair made on one machine cannot be used from another. `spotty setup` names
+its key pair after the host — `spotty-key-tink` — so each machine creates and
+owns its own, and running setup on a second machine no longer trips over the
+first machine's key.
+
+The consequence is that an instance is reachable from the machine that launched
+it: the key pair is baked into the instance at launch. If you need to launch on
+one machine and SSH from another, share one key pair instead — import a public
+key you already have on both:
+
+```bash
+aws ec2 import-key-pair --key-name spotty-shared \
+    --public-key-material fileb://~/.ssh/id_ed25519.pub --region eu-north-1
+spotty config set key_name spotty-shared
+spotty config set key_path ~/.ssh/id_ed25519
+```
 
 Pass `--skip-ec2` to leave the key pair and security group alone, or manage
 them yourself:

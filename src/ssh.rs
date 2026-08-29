@@ -29,7 +29,7 @@ pub async fn ssh_into_instance(
     } else {
         // Try to find key based on instance's key name
         let key_name = get_instance_key_name(&clients, &instance_id).await?;
-        find_key_file(&key_name)
+        find_key_file_verbose(&key_name)
     };
 
     eprintln!("Connecting to {} ({})...", instance_id, ip);
@@ -113,7 +113,7 @@ pub async fn run_command(
         Some(expand_tilde(k).into_owned())
     } else {
         let key_name = get_instance_key_name(&clients, instance_id).await?;
-        find_key_file(&key_name)
+        find_key_file_verbose(&key_name)
     };
 
     let user = config.defaults.ssh_user.as_deref().unwrap_or("ec2-user");
@@ -157,7 +157,7 @@ pub async fn deploy_to_instance(
         Some(expand_tilde(k).into_owned())
     } else {
         let key_name = get_instance_key_name(&clients, &instance_id).await?;
-        find_key_file(&key_name)
+        find_key_file_verbose(&key_name)
     };
 
     // Wait for SSH to be ready
@@ -223,7 +223,12 @@ pub async fn deploy_to_instance(
     Ok(())
 }
 
-fn find_key_file(key_name: &str) -> Option<String> {
+/// Locate the private key for an EC2 key pair in `~/.ssh`, quietly.
+///
+/// Also answers "can this machine actually use that key pair?" — AWS hands out
+/// the private key only at creation, so a key pair created on another machine
+/// has no file here.
+pub fn find_key_file(key_name: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let ssh_dir = PathBuf::from(&home).join(".ssh");
 
@@ -234,13 +239,22 @@ fn find_key_file(key_name: &str) -> Option<String> {
         ssh_dir.join(format!("{}.key", key_name)),
     ];
 
-    for path in &candidates {
-        if path.exists() {
-            eprintln!("Using key: {}", path.display());
-            return Some(path.to_string_lossy().to_string());
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// As [`find_key_file`], reporting what it settled on.
+fn find_key_file_verbose(key_name: &str) -> Option<String> {
+    match find_key_file(key_name) {
+        Some(path) => {
+            eprintln!("Using key: {path}");
+            Some(path)
+        }
+        None => {
+            eprintln!("Warning: Could not find key file for '{}' in ~/.ssh/", key_name);
+            None
         }
     }
-
-    eprintln!("Warning: Could not find key file for '{}' in ~/.ssh/", key_name);
-    None
 }

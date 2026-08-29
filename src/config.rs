@@ -60,16 +60,28 @@ impl Config {
     /// pass a foreign `sg-...` to EC2 and fail with InvalidGroup.NotFound
     /// instead of creating the group it needs.
     pub fn region_defaults(&self, region: &str) -> RegionDefaults {
-        if let Some(found) = self.regions.get(region) {
-            return found.clone();
-        }
-        match self.defaults.region.as_deref() {
-            Some(r) if r != region => RegionDefaults::default(),
-            _ => RegionDefaults {
-                key_name: self.defaults.key_name.clone(),
-                key_path: self.defaults.key_path.clone(),
-                security_group: self.defaults.security_group.clone(),
-            },
+        let entry = self.regions.get(region);
+
+        // Merge field by field rather than letting a `[regions]` block shadow
+        // `[defaults]` wholesale: setup writes a partial block (a security
+        // group but no key pair, say), and the fields it left out should still
+        // fall through to whatever the user set by hand.
+        let fallback = match self.defaults.region.as_deref() {
+            Some(r) if r != region => &Defaults::default(),
+            _ => &self.defaults,
+        };
+
+        let pick = |from_region: Option<&String>, from_defaults: &Option<String>| {
+            from_region.cloned().or_else(|| from_defaults.clone())
+        };
+
+        RegionDefaults {
+            key_name: pick(entry.and_then(|e| e.key_name.as_ref()), &fallback.key_name),
+            key_path: pick(entry.and_then(|e| e.key_path.as_ref()), &fallback.key_path),
+            security_group: pick(
+                entry.and_then(|e| e.security_group.as_ref()),
+                &fallback.security_group,
+            ),
         }
     }
 
@@ -206,6 +218,23 @@ mod tests {
         let elsewhere = config.region_defaults("us-east-1");
         assert_eq!(elsewhere.security_group, None);
         assert_eq!(elsewhere.key_name, None);
+    }
+
+    #[test]
+    fn a_partial_region_block_does_not_hide_defaults() {
+        // `setup` writes whatever it managed to create — a security group but
+        // no key pair, if the key step was skipped. The fields it left out
+        // still have to fall through to what the user set by hand, or
+        // `spotty config set key_name ...` would silently do nothing.
+        let mut config = config_with_defaults(Some("eu-north-1"));
+        config.regions.insert(
+            "eu-north-1".into(),
+            RegionDefaults { security_group: Some("sg-fromsetup".into()), ..Default::default() },
+        );
+
+        let merged = config.region_defaults("eu-north-1");
+        assert_eq!(merged.security_group.as_deref(), Some("sg-fromsetup"));
+        assert_eq!(merged.key_name.as_deref(), Some("spotty-key"));
     }
 
     #[test]
