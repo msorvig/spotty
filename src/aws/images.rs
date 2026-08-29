@@ -8,8 +8,8 @@ use super::client::AwsClients;
 use super::instances::{self, LaunchConfig};
 use crate::config::Config;
 use crate::ec2;
-use crate::ssh::{self, find_key_file};
-use crate::utils::{add_ssh_options, expand_tilde};
+use crate::ssh;
+use crate::utils::add_ssh_options;
 
 #[derive(Debug, Serialize, Tabled)]
 pub struct AmiInfo {
@@ -407,12 +407,7 @@ async fn build_image_inner(
 
     // Get IP and key
     let ip = instances::get_instance_public_ip(&clients, instance_id).await?;
-    let key_name = instances::get_instance_key_name(&clients, instance_id).await?;
-    let key_path = if let Some(ref k) = config.region_defaults(&clients.region).key_path {
-        Some(expand_tilde(k).into_owned())
-    } else {
-        find_key_file(&key_name)
-    };
+    let key_path = ssh::resolve_key_path(&clients, &config, instance_id, None).await?;
 
     let user = config
         .defaults

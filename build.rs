@@ -13,6 +13,7 @@ fn main() {
             "DescribeInstances",
             "DescribeKeyPairs",
             "CreateKeyPair",
+            "DeleteKeyPair",
             "DescribeSecurityGroups",
             "DescribeVpcs",
             "CreateSecurityGroup",

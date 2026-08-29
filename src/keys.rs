@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
 use crate::aws::client::AwsClients;
@@ -100,4 +100,78 @@ pub async fn list_key_pairs(region: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Delete a key pair from AWS and remove its private key from `~/.ssh`.
+///
+/// Refuses while an instance is still using the key pair: deleting the local
+/// private key would lock you out of a machine that is running and billing.
+/// The AWS-side key pair is only a stored public key, so removing it never
+/// affects an instance that is already up — only future launches by that name.
+pub async fn remove_key_pair(name: &str, region: Option<String>, force: bool) -> Result<()> {
+    let clients = AwsClients::new(region).await?;
+
+    let in_use = instances_using_key(&clients, name).await?;
+    if !in_use.is_empty() && !force {
+        bail!(
+            "key pair '{}' is still in use by {}. Terminate {} first, or pass --force to \
+             delete the key anyway (you will not be able to SSH in afterwards).",
+            name,
+            in_use.join(", "),
+            if in_use.len() == 1 { "it" } else { "them" },
+        );
+    }
+    if !in_use.is_empty() {
+        eprintln!("Warning: {} still uses '{}'.", in_use.join(", "), name);
+    }
+
+    ec2::delete_key_pair(
+        &clients.client,
+        ec2::DeleteKeyPairRequest::default().key_name(name),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))
+    .with_context(|| format!("failed to delete key pair '{name}' in {}", clients.region))?;
+    println!("Deleted key pair '{}' in {}.", name, clients.region);
+
+    // DeleteKeyPair succeeds whether or not the key pair existed, so say
+    // plainly what happened to the local file rather than implying more.
+    let local = ssh_dir()?.join(format!("{name}.pem"));
+    if local.exists() {
+        std::fs::remove_file(&local)?;
+        println!("Removed {}.", local.display());
+    } else {
+        println!("No local private key at {}.", local.display());
+    }
+
+    Ok(())
+}
+
+/// Non-terminated instances launched with `key_name`.
+async fn instances_using_key(clients: &AwsClients, key_name: &str) -> Result<Vec<String>> {
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .filters(ec2::Filter::default().name("key-name").values(key_name))
+            .filters(
+                ec2::Filter::default()
+                    .name("instance-state-name")
+                    .values("pending")
+                    .values("running")
+                    .values("stopping")
+                    .values("stopped"),
+            ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))
+    .context("failed to check whether the key pair is in use")?;
+
+    Ok(resp
+        .reservations
+        .iter()
+        .flat_map(|l| &l.item)
+        .filter_map(|r| r.instances.as_ref())
+        .flat_map(|l| &l.item)
+        .filter_map(|i| i.instance_id.clone())
+        .collect())
 }

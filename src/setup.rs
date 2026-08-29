@@ -621,6 +621,12 @@ fn permission_policy(account_id: &str) -> String {
       ]
     }},
     {{
+      "Sid": "ManageOwnKeyPairs",
+      "Effect": "Allow",
+      "Action": "ec2:DeleteKeyPair",
+      "Resource": "arn:aws:ec2:*:{account_id}:key-pair/spotty-*"
+    }},
+    {{
       "Sid": "ManageOwnImages",
       "Effect": "Allow",
       "Action": [

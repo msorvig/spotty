@@ -299,6 +299,19 @@ enum KeysAction {
         #[arg(long, short)]
         region: Option<String>,
     },
+    /// Delete a key pair from AWS and remove its local private key
+    Rm {
+        /// Key pair name
+        name: String,
+
+        /// Delete even while instances are still using it
+        #[arg(long)]
+        force: bool,
+
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -695,6 +708,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Keys { action } => match action {
             KeysAction::Create { name, region } => keys::create_key_pair(&name, region).await?,
             KeysAction::List { region } => keys::list_key_pairs(region).await?,
+            KeysAction::Rm { name, force, region } => {
+                keys::remove_key_pair(&name, region, force).await?
+            }
         },
         Commands::Lambda { action } => match action {
             LambdaAction::Deploy {
