@@ -49,7 +49,7 @@ pub async fn run(opts: SetupOptions) -> Result<()> {
     println!("  start URL : {}", sso_config.start_url);
     println!("  session   : {}", sso_config.session_name);
 
-    let cached = sso::load_cached_token(&sso_config.session_name).filter(|t| t.is_valid());
+    let cached = sso::load_or_refresh_token(&sso_config).await;
     let token = match cached {
         Some(t) if !opts.force_login => {
             println!("  token     : valid for {}", format_duration(t.expires_in()));
@@ -301,11 +301,11 @@ pub async fn status(region: Option<String>) -> Result<()> {
         Ok(c) => {
             println!("  session     : {}", c.session_name);
             println!("  start URL   : {}", c.start_url);
-            match sso::load_cached_token(&c.session_name) {
-                Some(t) if t.is_valid() => {
-                    println!("  token       : valid for {}", format_duration(t.expires_in()))
+            match sso::load_or_refresh_token(&c).await {
+                Some(t) => println!("  token       : valid for {}", format_duration(t.expires_in())),
+                None if sso::load_cached_token(&c.session_name).is_some() => {
+                    println!("  token       : EXPIRED and could not be refreshed — run `spotty setup`")
                 }
-                Some(_) => println!("  token       : EXPIRED — run `spotty setup`"),
                 None => println!("  token       : none — run `spotty setup`"),
             }
         }

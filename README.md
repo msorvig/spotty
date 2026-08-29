@@ -85,6 +85,16 @@ permission-set privileges rather than the scoped role.
 3. Cached SSO token → permission set → `sts:AssumeRole` into the `spotty` role
 4. `aws configure export-credentials`, for setups that do not use SSO
 
+### Session lifetime
+
+IAM Identity Center access tokens are short — an hour, typically — and come
+with a refresh token good for the rest of the SSO session. Spotty spends the
+refresh token automatically, so an expired access token costs a round trip, not
+a browser. You only log in again when the SSO session itself ends, which your
+identity provider decides (often 8 hours, sometimes longer).
+
+`spotty setup --status` shows how long the current token has left.
+
 ### Logging in over SSH
 
 The login uses the OAuth 2.0 device authorization grant, which is designed for

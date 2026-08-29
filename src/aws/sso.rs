@@ -185,6 +185,70 @@ fn save_cached_token(session_name: &str, token: &CachedToken) -> Result<()> {
     crate::utils::write_secret(&token_cache_path(session_name)?, &serde_json::to_string_pretty(token)?)
 }
 
+/// The cached token for `config`, renewed if it has run out.
+///
+/// IAM Identity Center hands out a short-lived access token — an hour is
+/// typical — alongside a refresh token good for the rest of the SSO session.
+/// Without spending the refresh token, spotty would send you back to the
+/// browser every hour, while `aws` in the next terminal carries on.
+///
+/// `None` means a real login is needed: no token cached, or the refresh was
+/// refused because the session itself has ended.
+pub async fn load_or_refresh_token(config: &SsoConfig) -> Option<CachedToken> {
+    let cached = load_cached_token(&config.session_name)?;
+    if cached.is_valid() {
+        return Some(cached);
+    }
+
+    match refresh_token(config, &cached).await {
+        Ok(fresh) => Some(fresh),
+        Err(e) => {
+            tracing::debug!("SSO token refresh failed, falling back to login: {e}");
+            None
+        }
+    }
+}
+
+/// Exchange the refresh token for a new access token.
+async fn refresh_token(config: &SsoConfig, stale: &CachedToken) -> Result<CachedToken> {
+    let client_id = stale.client_id.as_deref().context("cached token has no clientId")?;
+    let client_secret = stale
+        .client_secret
+        .as_deref()
+        .context("cached token has no clientSecret")?;
+    let refresh = stale
+        .refresh_token
+        .as_deref()
+        .context("cached token has no refreshToken")?;
+
+    let client = Client::anonymous(&config.sso_region);
+    let resp = sso_oidc::create_token(
+        &client,
+        sso_oidc::CreateTokenRequest::default()
+            .client_id(client_id)
+            .client_secret(client_secret)
+            .grant_type("refresh_token")
+            .refresh_token(refresh),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .context("CreateToken(refresh_token) failed")?;
+
+    let cached = CachedToken {
+        start_url: config.start_url.clone(),
+        region: config.sso_region.clone(),
+        access_token: resp.access_token.context("refresh returned no accessToken")?,
+        expires_at: format_rfc3339(now_secs() + resp.expires_in.unwrap_or(3600).max(0) as u64),
+        client_id: Some(client_id.to_string()),
+        client_secret: Some(client_secret.to_string()),
+        // Refresh tokens are rotated: keep the new one, or the next refresh
+        // is rejected and the hourly browser trip comes back.
+        refresh_token: resp.refresh_token.or_else(|| stale.refresh_token.clone()),
+    };
+    save_cached_token(&config.session_name, &cached)?;
+    Ok(cached)
+}
+
 // ── Device authorization flow ──────────────────────────────────────────
 
 /// How the verification URL should reach the user.

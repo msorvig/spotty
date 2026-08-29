@@ -171,44 +171,44 @@ pub async fn resolve(region: Option<String>, privilege: Privilege) -> Result<Res
 
     // 3. SSO: cached token → permission-set credentials → scoped role.
     if let Some(ref sso_config) = sso_config {
-        if let Some(token) = sso::load_cached_token(&sso_config.session_name) {
-            if token.is_valid() {
-                let account_id = sso_config.account_id.clone().context(
-                    "profile has no sso_account_id; set one or run `spotty setup`",
-                )?;
-                let permission_set = sso_config.role_name.clone().context(
-                    "profile has no sso_role_name; set one or run `spotty setup`",
-                )?;
+        if let Some(token) = sso::load_or_refresh_token(sso_config).await {
+            let account_id = sso_config
+                .account_id
+                .clone()
+                .context("profile has no sso_account_id; set one or run `spotty setup`")?;
+            let permission_set = sso_config
+                .role_name
+                .clone()
+                .context("profile has no sso_role_name; set one or run `spotty setup`")?;
 
-                let base = sso::role_credentials(sso_config, &token, &account_id, &permission_set)
-                    .await?;
+            let base =
+                sso::role_credentials(sso_config, &token, &account_id, &permission_set).await?;
 
-                if privilege == Privilege::Elevated {
+            if privilege == Privilege::Elevated {
+                return Ok(Resolved {
+                    credentials: base.into_aws(region),
+                    source: CredentialSource::PermissionSet { account_id, role_name: permission_set },
+                });
+            }
+
+            match role_arn {
+                Some(arn) => {
+                    let scoped = assume_role(&base, &region, &arn).await?;
+                    let mut cache = load_cache();
+                    cache.roles.insert(cache_key(&arn, &region), scoped.clone());
+                    save_cache(&cache)?;
+                    return Ok(Resolved {
+                        credentials: scoped.into_aws(region),
+                        source: CredentialSource::ScopedRole(arn),
+                    });
+                }
+                // No scoped role configured yet. Usable, but this is the
+                // over-privileged path `setup` exists to get you off.
+                None => {
                     return Ok(Resolved {
                         credentials: base.into_aws(region),
                         source: CredentialSource::PermissionSet { account_id, role_name: permission_set },
                     });
-                }
-
-                match role_arn {
-                    Some(arn) => {
-                        let scoped = assume_role(&base, &region, &arn).await?;
-                        let mut cache = load_cache();
-                        cache.roles.insert(cache_key(&arn, &region), scoped.clone());
-                        save_cache(&cache)?;
-                        return Ok(Resolved {
-                            credentials: scoped.into_aws(region),
-                            source: CredentialSource::ScopedRole(arn),
-                        });
-                    }
-                    // No scoped role configured yet. Usable, but this is the
-                    // over-privileged path `setup` exists to get you off.
-                    None => {
-                        return Ok(Resolved {
-                            credentials: base.into_aws(region),
-                            source: CredentialSource::PermissionSet { account_id, role_name: permission_set },
-                        });
-                    }
                 }
             }
         }
