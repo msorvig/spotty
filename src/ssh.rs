@@ -15,7 +15,7 @@ pub async fn ssh_into_instance(
     command: Option<String>,
     region: Option<String>,
 ) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     let config = Config::load()?;
 
     // Get instance public IP
@@ -24,7 +24,7 @@ pub async fn ssh_into_instance(
     // Resolve key path: CLI arg > config > discover from instance
     let key_path = if let Some(k) = key {
         Some(expand_tilde(&k).into_owned())
-    } else if let Some(ref k) = config.defaults.key_path {
+    } else if let Some(ref k) = config.region_defaults(&clients.region).key_path {
         Some(expand_tilde(k).into_owned())
     } else {
         // Try to find key based on instance's key name
@@ -104,12 +104,12 @@ pub async fn run_command(
     command: &str,
     region: Option<String>,
 ) -> Result<String> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     let config = Config::load()?;
 
     let ip = get_instance_public_ip(&clients, instance_id).await?;
 
-    let key_path = if let Some(ref k) = config.defaults.key_path {
+    let key_path = if let Some(ref k) = config.region_defaults(&clients.region).key_path {
         Some(expand_tilde(k).into_owned())
     } else {
         let key_name = get_instance_key_name(&clients, instance_id).await?;
@@ -146,14 +146,14 @@ pub async fn deploy_to_instance(
     command: Option<String>,
     region: Option<String>,
 ) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     let config = Config::load()?;
 
     let ip = get_instance_public_ip(&clients, &instance_id).await?;
 
     let key_path = if let Some(k) = key {
         Some(expand_tilde(&k).into_owned())
-    } else if let Some(ref k) = config.defaults.key_path {
+    } else if let Some(ref k) = config.region_defaults(&clients.region).key_path {
         Some(expand_tilde(k).into_owned())
     } else {
         let key_name = get_instance_key_name(&clients, &instance_id).await?;

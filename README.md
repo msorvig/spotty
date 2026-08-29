@@ -15,18 +15,102 @@ cargo build --release
 ./target/release/spotty --help
 ```
 
-## AWS Credentials Setup
-
-Spotty uses the standard AWS SDK credential chain. Configure credentials using one of these methods:
-
-### Option 1: AWS SSO
+## Setup
 
 ```bash
-aws sso login --profile my-profile
-export AWS_PROFILE=my-profile
+spotty setup
 ```
 
-### Option 2: Environment Variables
+This logs you in to IAM Identity Center and prepares the account. It is the
+only command that needs administrative access, and it uses that access exactly
+once — to create a scoped IAM role that everything afterwards runs as.
+
+```
+$ spotty setup
+IAM Identity Center
+  start URL : https://d-xxxxxxxxxx.awsapps.com/start/
+  session   : my-sso
+
+Confirm this login in a browser:
+
+  https://d-xxxxxxxxxx.awsapps.com/start/#/device?user_code=GQJD-SHHP
+
+Waiting for approval...
+```
+
+Useful flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--status` | Show the current login, credential source and identity |
+| `--check` | Verify the credentials carry the permissions spotty needs; exits non-zero if any are missing |
+| `--dry-run` | Log in and print the policies, changing nothing |
+| `--no-browser` | Print the link instead of opening a browser |
+| `--export` | Print shell exports for the scoped credentials |
+| `--logout` | Forget cached role credentials |
+
+### Why a scoped role
+
+An SSO permission set usually grants far more than spotty needs —
+`AdministratorAccess`, in a lot of setups. Rather than run every command with
+that authority, `spotty setup` creates an IAM role named `spotty` whose policy
+covers only what the tool actually calls, and day-to-day commands assume it:
+
+```
+SSO login  →  permission set  →  sts:AssumeRole  →  spotty role  →  EC2/Lambda
+             (setup only)                          (1h, cached)
+```
+
+The permission-set credentials are used for the `AssumeRole` call and are never
+written to disk. Assumed-role credentials last an hour and are cached in
+`~/.cache/spotty/credentials.json` (mode 0600).
+
+The role's policy is narrower than a flat allow-list in two ways worth knowing:
+terminating instances, imaging them and deregistering AMIs are conditioned on
+the `ManagedBy=spotty` tag, so the role cannot touch resources it did not
+create; and Lambda permissions are restricted to functions named `spotty-*`.
+Run `spotty setup --dry-run` to see the exact policy before it is applied.
+
+Tightening `DeregisterImage`/`DeleteSnapshot` onto that tag means AMIs created
+by a spotty older than this one — whose backing snapshots were left untagged —
+have to be removed with a credential outside the scoped role.
+
+`spotty setup --status` will tell you if you are still running with
+permission-set privileges rather than the scoped role.
+
+### Credential resolution order
+
+1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — an explicit override always wins
+2. Cached scoped-role credentials, while still valid
+3. Cached SSO token → permission set → `sts:AssumeRole` into the `spotty` role
+4. `aws configure export-credentials`, for setups that do not use SSO
+
+### Logging in over SSH
+
+The login uses the OAuth 2.0 device authorization grant, which is designed for
+machines without a browser. On a remote host, `spotty setup` prints a link and
+a short code; you approve it on any other device. Nothing secret is copied
+between machines — the user code is a public one-time code — and no port
+forwarding is needed.
+
+Spotty skips the browser automatically when it detects an SSH session or a
+machine with no display. Force it with `--no-browser`.
+
+For CI, or a host that should not enrol in SSO at all, mint scoped credentials
+elsewhere and pass them in:
+
+```bash
+spotty setup --export        # prints AWS_* exports, valid for one hour
+```
+
+These are real secrets, unlike the device code — but they are short-lived and
+carry only the scoped role's permissions. For instances spotty launches itself,
+prefer an EC2 instance profile so no credentials travel at all.
+
+### Without IAM Identity Center
+
+Spotty also accepts ordinary credentials, in which case it runs with whatever
+those grant and no role is created:
 
 ```bash
 export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
@@ -36,7 +120,9 @@ export AWS_REGION=us-east-1
 
 ### Required IAM Permissions
 
-Your IAM user/role needs these permissions:
+`spotty setup` attaches these to the `spotty` role for you. You need them (plus
+`iam:CreateRole`, `iam:PutRolePolicy` and `sts:AssumeRole`) on the identity you
+run `setup` with:
 
 ```json
 {
@@ -104,28 +190,42 @@ For `spotty watch setup` (macOS only), you also need IAM permissions (one-time s
 
 ## Quick Start
 
-### 1. Initialize Configuration
+### 1. Log in and prepare the account
 
 ```bash
-spotty config init
+spotty setup
 ```
 
-Edit `~/.config/spotty/config.toml`:
+Besides logging in and creating the scoped role, this creates an SSH key pair
+and a `spotty-default` security group if you do not already have them, and
+writes the result to `~/.config/spotty/config.toml`:
 
 ```toml
 [defaults]
-# region = "us-east-1"          # Optional: uses AWS_REGION or ~/.aws/config by default
-key_name = "my-aws-keypair"      # Name of your EC2 key pair (auto-discovered if not set)
-key_path = "~/.ssh/my-key.pem"   # Path to private key file (auto-discovered from key_name)
+region = "eu-north-1"
+role_arn = "arn:aws:iam::123456789012:role/spotty"   # written by `spotty setup`
 ssh_user = "ec2-user"
+
+[regions.eu-north-1]
+key_name = "spotty-key"          # Name of your EC2 key pair
+key_path = "~/.ssh/spotty-key.pem"
+security_group = "sg-0123456789abcdef0"
 ```
 
-Or create a key pair with spotty:
+Key pairs and security groups exist inside a single region, so `setup` records
+them under `[regions.<name>]`. Running `spotty setup --region <other>` adds a
+second block rather than overwriting the first.
+
+Pass `--skip-ec2` to leave the key pair and security group alone, or manage
+them yourself:
 
 ```bash
 spotty keys create my-key
 # Creates key in AWS and saves to ~/.ssh/my-key.pem
 ```
+
+`spotty config init` still writes a bare config file if you would rather set
+everything by hand.
 
 ### 2. Find Cheap Spot Instances
 
@@ -374,10 +474,14 @@ Config file location: `~/.config/spotty/config.toml`
 ```toml
 [defaults]
 # region = "us-east-1"         # Optional: uses AWS SDK default (AWS_REGION, ~/.aws/config)
-# key_name = "my-keypair"      # Optional: auto-discovered from available keys
-# key_path = "~/.ssh/my-key.pem" # Optional: auto-discovered from key_name
 ssh_user = "ec2-user"          # Default SSH username
-# security_group = "sg-12345"  # Optional: auto-created if not set
+
+# Written by `spotty setup`, one block per region it has run in.
+# Values under [defaults] are used only in the region named there.
+[regions.us-east-1]
+# key_name = "my-keypair"        # Optional: auto-discovered from available keys
+# key_path = "~/.ssh/my-key.pem" # Optional: auto-discovered from key_name
+# security_group = "sg-12345"    # Optional: auto-created if not set
 
 [ami]
 # Override AMI discovery per region/architecture
@@ -479,12 +583,35 @@ spotty start --instance-type t3.micro --no-auto-cleanup
 
 ## Troubleshooting
 
-### "No credentials found"
+### "not logged in" / "no AWS credentials found"
 
-Ensure AWS credentials are configured:
+Check what spotty is resolving and whether the SSO token is still valid:
 ```bash
-aws sts get-caller-identity
+spotty setup --status
 ```
+
+Log in again with:
+```bash
+spotty setup
+```
+
+### "failed to assume arn:aws:iam::...:role/spotty"
+
+The scoped role is missing or its trust policy changed. Re-create it:
+```bash
+spotty setup
+```
+
+If commands fail with `UnauthorizedOperation` after the role exists, its policy
+may be stale — `spotty setup --check` reports which permissions are missing,
+and re-running `spotty setup` refreshes the policy.
+
+### The watcher's IAM user
+
+`spotty watch setup` deliberately uses long-lived access keys rather than the
+scoped role: it has to terminate instances after your SSO session has expired,
+with nobody present to log in again. Its policy is limited to
+`ec2:DescribeInstances` and terminating instances tagged `ManagedBy=spotty`.
 
 ### "Instance has no public IP"
 

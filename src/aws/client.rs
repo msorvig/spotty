@@ -1,31 +1,35 @@
 use anyhow::Result;
 use aws_runtime_async::aws::Client;
 
-use crate::config::Config;
+use crate::aws::creds::{self, CredentialSource, Privilege};
 
 pub struct AwsClients {
     pub client: Client,
     pub region: String,
+    /// Which credential source backed this client, for `setup --status` and
+    /// for telling the user when they are running over-privileged.
+    pub source: CredentialSource,
 }
 
 impl AwsClients {
-    pub fn new(region: Option<String>) -> Result<Self> {
-        let spotty_config = Config::load().unwrap_or_default();
+    /// A client using the scoped `spotty` role where one is configured.
+    pub async fn new(region: Option<String>) -> Result<Self> {
+        Self::with_privilege(region, Privilege::Scoped).await
+    }
 
-        // Use CLI region, then spotty config region, then let aws-gen resolve
-        let explicit_region = region.or(spotty_config.defaults.region.clone());
+    /// A client using the SSO permission set directly. Only `spotty setup`
+    /// should need this — it is what creates the scoped role.
+    pub async fn elevated(region: Option<String>) -> Result<Self> {
+        Self::with_privilege(region, Privilege::Elevated).await
+    }
 
-        let mut client = Client::from_env();
-
-        if let Some(ref r) = explicit_region {
-            client.creds.region = r.clone();
-        }
-
-        let region_str = client.creds.region.clone();
-
+    async fn with_privilege(region: Option<String>, privilege: Privilege) -> Result<Self> {
+        let resolved = creds::resolve(region, privilege).await?;
+        let region = resolved.credentials.region.clone();
         Ok(Self {
-            client,
-            region: region_str,
+            client: Client::new(resolved.credentials),
+            region,
+            source: resolved.source,
         })
     }
 }

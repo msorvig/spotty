@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use spotty::aws::instances::LaunchConfig;
 use spotty::aws::lambda::LambdaDeployConfig;
-use spotty::{aws, config, keys, ssh, InstanceFilterArgs, SortField};
+use spotty::{aws, config, keys, setup, ssh, InstanceFilterArgs, SortField};
 #[cfg(target_os = "macos")]
 use spotty::{launchd, watch};
 
@@ -20,6 +20,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Log in to AWS and prepare the account for spotty
+    Setup {
+        /// AWS region
+        #[arg(long, short)]
+        region: Option<String>,
+
+        /// Profile in ~/.aws/config to take SSO settings from
+        #[arg(long, short)]
+        profile: Option<String>,
+
+        /// Name of the scoped IAM role to create
+        #[arg(long, default_value = "spotty")]
+        role_name: String,
+
+        /// Print the login link instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+
+        /// Log in and show what would change, without touching the account
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip creating the SSH key pair and security group
+        #[arg(long)]
+        skip_ec2: bool,
+
+        /// Log in again even if the cached token is still valid
+        #[arg(long)]
+        force_login: bool,
+
+        /// Show the current login and credential state, and exit
+        #[arg(long, conflicts_with_all = ["dry_run", "force_login"])]
+        status: bool,
+
+        /// Check that the current credentials carry the needed permissions
+        #[arg(long, conflicts_with_all = ["dry_run", "force_login", "status"])]
+        check: bool,
+
+        /// Print shell exports for the scoped credentials (secrets on stdout)
+        #[arg(long, conflicts_with_all = ["dry_run", "force_login", "status", "check"])]
+        export: bool,
+
+        /// Forget cached role credentials
+        #[arg(long, conflicts_with_all = ["dry_run", "force_login", "status", "check", "export"])]
+        logout: bool,
+    },
+
     /// List current spot prices with filtering
     Prices {
         /// AWS region
@@ -457,6 +504,41 @@ async fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Setup {
+            region,
+            profile,
+            role_name,
+            no_browser,
+            dry_run,
+            skip_ec2,
+            force_login,
+            status,
+            check,
+            export,
+            logout,
+        } => {
+            if logout {
+                setup::logout()?;
+            } else if status {
+                setup::status(region).await?;
+            } else if check {
+                setup::preflight(region).await?;
+            } else if export {
+                setup::export(region).await?;
+            } else {
+                setup::run(setup::SetupOptions {
+                    region,
+                    profile,
+                    role_name: Some(role_name),
+                    no_browser,
+                    dry_run,
+                    skip_ec2,
+                    force_login,
+                })
+                .await?;
+            }
+        }
+
         Commands::Prices {
             region,
             filter,

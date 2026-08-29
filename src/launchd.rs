@@ -316,15 +316,14 @@ const WATCHER_POLICY: &str = r#"{
 /// Set up the watcher with dedicated IAM credentials.
 /// Creates an IAM user with minimal permissions and stores credentials locally.
 pub async fn setup(region: Option<String>) -> Result<()> {
-    use aws_runtime_async::aws::Client;
+    use crate::aws::client::AwsClients;
     use crate::iam;
 
     eprintln!("Setting up spotty-watcher IAM user with minimal permissions...\n");
 
-    let mut client = Client::from_env();
-    if let Some(ref r) = region {
-        client.creds.region = r.clone();
-    }
+    // Creating an IAM user needs more than the scoped runtime role grants —
+    // withholding IAM administration is the point of that role.
+    let client = AwsClients::elevated(region).await?.client;
 
     // Step 1: Create IAM user (or check if exists)
     eprint!("Creating IAM user '{}'... ", IAM_USER_NAME);

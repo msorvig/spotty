@@ -45,7 +45,7 @@ pub async fn list_spot_prices(
     limit: usize,
 ) -> Result<Vec<SpotPrice>> {
     debug!("Creating AWS clients");
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     debug!(region = %clients.region, "Using region");
 
     debug!("Fetching instance types and spot prices concurrently");

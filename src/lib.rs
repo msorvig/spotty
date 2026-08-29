@@ -55,12 +55,23 @@ pub mod sts {
     include!(concat!(env!("OUT_DIR"), "/sts.rs"));
 }
 
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod sso_oidc {
+    include!(concat!(env!("OUT_DIR"), "/sso-oidc.rs"));
+}
+
+#[allow(dead_code, non_snake_case, unused_variables, clippy::all)]
+pub mod sso_portal {
+    include!(concat!(env!("OUT_DIR"), "/sso.rs"));
+}
+
 pub mod aws;
 pub mod config;
 pub mod keys;
 #[cfg(target_os = "macos")]
 pub mod launchd;
 pub mod output;
+pub mod setup;
 pub mod ssh;
 pub mod state;
 pub mod utils;

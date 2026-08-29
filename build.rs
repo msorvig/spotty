@@ -50,6 +50,8 @@ fn main() {
             "CreateRole",
             "GetRole",
             "AttachRolePolicy",
+            "PutRolePolicy",
+            "UpdateAssumeRolePolicy",
         ],
         sync: false,
     }.generate();
@@ -79,6 +81,34 @@ fn main() {
         runtime_crate: "aws_runtime_async",
         operations:    &[
             "GetCallerIdentity",
+            "AssumeRole",
+        ],
+        sync: false,
+    }.generate();
+
+    // IAM Identity Center device-authorization login. Every operation here is
+    // unsigned: these are the calls that produce credentials in the first
+    // place.
+    GenerateSpec {
+        name:          "sso-oidc",
+        protocol:      Protocol::RestJson,
+        runtime_crate: "aws_runtime_async",
+        operations:    &[
+            "RegisterClient",
+            "StartDeviceAuthorization",
+            "CreateToken",
+        ],
+        sync: false,
+    }.generate();
+
+    GenerateSpec {
+        name:          "sso",
+        protocol:      Protocol::RestJson,
+        runtime_crate: "aws_runtime_async",
+        operations:    &[
+            "GetRoleCredentials",
+            "ListAccounts",
+            "ListAccountRoles",
         ],
         sync: false,
     }.generate();

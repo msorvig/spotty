@@ -12,7 +12,7 @@ fn ssh_dir() -> Result<PathBuf> {
 }
 
 pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     // Check if key already exists in AWS
     let existing = ec2::describe_key_pairs(
@@ -66,7 +66,7 @@ pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
 }
 
 pub async fn list_key_pairs(region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let resp = ec2::describe_key_pairs(
         &clients.client,

@@ -62,7 +62,7 @@ async fn get_image_sizes(
 
 /// List available AMIs: base AL2023 images from SSM + spotty-created + config AMIs.
 pub async fn list_images(region: Option<String>) -> Result<Vec<AmiInfo>> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     let config = Config::load().unwrap_or_default();
 
     let mut images: Vec<AmiInfo> = Vec::new();
@@ -211,7 +211,7 @@ pub async fn create_image(
     wait: bool,
     region: Option<String>,
 ) -> Result<String> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     // Verify instance exists and get its type
     let resp = ec2::describe_instances(
@@ -275,6 +275,17 @@ pub async fn create_image(
                             .key("Architecture")
                             .value(arch.clone()),
                     ),
+            )
+            // The backing snapshots are separate resources: without their own
+            // tag the scoped role cannot delete them when the AMI is removed.
+            .tag_specifications(
+                ec2::TagSpecification::default()
+                    .resource_type(ec2::ResourceType::Snapshot)
+                    .tags(
+                        ec2::Tag::default()
+                            .key("ManagedBy")
+                            .value("spotty"),
+                    ),
             ),
     )
     .await
@@ -296,7 +307,7 @@ pub async fn create_image(
 
 /// Deregister an AMI and delete its backing snapshots.
 pub async fn remove_image(ami_id: String, region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     // Get snapshot IDs before deregistering
     let resp = ec2::describe_images(
@@ -391,13 +402,13 @@ async fn build_image_inner(
     name: &Option<String>,
     region: &Option<String>,
 ) -> Result<()> {
-    let clients = AwsClients::new(region.clone())?;
+    let clients = AwsClients::new(region.clone()).await?;
     let config = Config::load().unwrap_or_default();
 
     // Get IP and key
     let ip = instances::get_instance_public_ip(&clients, instance_id).await?;
     let key_name = instances::get_instance_key_name(&clients, instance_id).await?;
-    let key_path = if let Some(ref k) = config.defaults.key_path {
+    let key_path = if let Some(ref k) = config.region_defaults(&clients.region).key_path {
         Some(expand_tilde(k).into_owned())
     } else {
         find_key_file(&key_name)

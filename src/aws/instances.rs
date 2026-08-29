@@ -99,7 +99,7 @@ async fn launch_instances_impl(
     config: &LaunchConfig,
     number: usize,
 ) -> Result<LaunchResult> {
-    let clients = AwsClients::new(config.region.clone())?;
+    let clients = AwsClients::new(config.region.clone()).await?;
     let spotty_config = Config::load()?;
 
     // Get candidate instance types
@@ -128,8 +128,10 @@ async fn launch_instances_impl(
         eprintln!("  ... and {} more", candidates.len() - 5);
     }
 
+    let region_defaults = spotty_config.region_defaults(&clients.region);
+
     // Resolve key name (do this once before trying instances)
-    let key = match config.key_name.clone().or(spotty_config.defaults.key_name.clone()) {
+    let key = match config.key_name.clone().or(region_defaults.key_name.clone()) {
         Some(k) => k,
         None => {
             eprintln!("Discovering SSH key...");
@@ -138,7 +140,7 @@ async fn launch_instances_impl(
     };
 
     // Resolve security group
-    let sg = match config.security_group.clone().or(spotty_config.defaults.security_group.clone()) {
+    let sg = match config.security_group.clone().or(region_defaults.security_group.clone()) {
         Some(sg) => sg,
         None => {
             eprintln!("Creating default security group...");
@@ -288,7 +290,7 @@ pub async fn start_instances(
 ) -> Result<Vec<InstanceInfo>> {
     let region = config.region.clone();
     let result = launch_instances_impl(&config, number).await?;
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     if wait {
         eprintln!("Waiting for instances to be running...");
@@ -310,7 +312,7 @@ pub async fn start_instances(
 pub async fn start_instance_and_get_id(config: LaunchConfig) -> Result<String> {
     let region = config.region.clone();
     let result = launch_instances_impl(&config, 1).await?;
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let instance_id = result.instance_ids.into_iter().next()
         .ok_or_else(|| anyhow::anyhow!("No instance ID returned"))?;
@@ -519,7 +521,7 @@ pub async fn stop_instances(
         }
     }
 
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     // If --all, find all spotty-managed running instances
     if all {
@@ -576,13 +578,13 @@ pub async fn instance_status(
     }
 
     // Add user's region (let AwsClients resolve from CLI/config/AWS SDK)
-    let user_clients = AwsClients::new(region)?;
+    let user_clients = AwsClients::new(region).await?;
     regions_to_query.insert(user_clients.region.clone());
 
     let mut all_instances: Vec<InstanceInfo> = Vec::new();
 
     for region in &regions_to_query {
-        let clients = AwsClients::new(Some(region.clone()))?;
+        let clients = AwsClients::new(Some(region.clone())).await?;
 
         let mut req = ec2::DescribeInstancesRequest::default();
 
@@ -774,7 +776,7 @@ async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<Strin
 /// Open a TCP port on the spotty-default security group.
 /// Idempotent — silently succeeds if the rule already exists.
 pub async fn open_port(port: u16, region: Option<String>) -> Result<()> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
     let sg_id = ensure_default_security_group(&clients).await?;
 
     match ec2::authorize_security_group_ingress(
@@ -796,7 +798,7 @@ pub async fn open_port(port: u16, region: Option<String>) -> Result<()> {
     }
 }
 
-async fn ensure_default_security_group(clients: &AwsClients) -> Result<String> {
+pub async fn ensure_default_security_group(clients: &AwsClients) -> Result<String> {
     // Check if spotty-default exists
     let resp = ec2::describe_security_groups(
         &clients.client,
@@ -1101,7 +1103,7 @@ pub async fn stop_auto_cleanup_instances(_region: Option<String>) -> Result<Vec<
     let mut all_terminated: Vec<String> = Vec::new();
 
     for region in regions {
-        let clients = AwsClients::new(Some(region.clone()))?;
+        let clients = AwsClients::new(Some(region.clone())).await?;
 
         // Query instances with ManagedBy=spotty AND AutoCleanup=true AND running/pending
         let resp = ec2::describe_instances(
@@ -1161,7 +1163,7 @@ pub struct RunningInstance {
 
 /// Get list of running spotty-managed instances.
 pub async fn get_running_instances(region: Option<String>) -> Result<Vec<RunningInstance>> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let resp = ec2::describe_instances(
         &clients.client,

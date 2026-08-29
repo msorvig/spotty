@@ -178,7 +178,7 @@ fn default_function_name(binary_path: &str) -> String {
 /// Deploy a binary as a Lambda function (create or update).
 /// Returns the function name.
 pub async fn deploy_function(config: LambdaDeployConfig) -> Result<String> {
-    let clients = AwsClients::new(config.region.clone())?;
+    let clients = AwsClients::new(config.region.clone()).await?;
     let function_name = config.name.clone()
         .unwrap_or_else(|| default_function_name(&config.binary_path));
 
@@ -244,7 +244,7 @@ pub async fn invoke_function(
     async_mode: bool,
     region: Option<String>,
 ) -> Result<InvokeResult> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let invocation_type = if async_mode {
         lambda_api::InvocationType::Event
@@ -279,7 +279,7 @@ pub async fn invoke_function(
 
 /// List spotty-managed Lambda functions.
 pub async fn list_functions(region: Option<String>) -> Result<Vec<LambdaFunctionInfo>> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let req = lambda_api::ListFunctionsRequest::default();
     let resp = lambda_api::list_functions(&clients.client, req)
@@ -318,7 +318,7 @@ pub async fn delete_functions(
     all: bool,
     region: Option<String>,
 ) -> Result<Vec<String>> {
-    let clients = AwsClients::new(region.clone())?;
+    let clients = AwsClients::new(region.clone()).await?;
 
     let to_delete = if all {
         let funcs = list_functions(region).await?;
@@ -347,7 +347,7 @@ pub async fn delete_functions(
 
 /// Get status of a Lambda function.
 pub async fn function_status(name: String, region: Option<String>) -> Result<LambdaFunctionInfo> {
-    let clients = AwsClients::new(region)?;
+    let clients = AwsClients::new(region).await?;
 
     let req = lambda_api::GetFunctionConfigurationRequest::default()
         .function_name(name);
