@@ -118,7 +118,7 @@ fn load_cache() -> CredentialCache {
 }
 
 fn save_cache(cache: &CredentialCache) -> Result<()> {
-    sso::write_secret(&cache_path()?, &serde_json::to_string_pretty(cache)?)
+    crate::utils::write_secret(&cache_path()?, &serde_json::to_string_pretty(cache)?)
 }
 
 /// Drop every cached credential — `spotty setup --logout`.

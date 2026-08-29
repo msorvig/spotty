@@ -1,6 +1,4 @@
 use anyhow::{bail, Result};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::aws::client::AwsClients;
@@ -49,15 +47,15 @@ pub async fn create_key_pair(name: &str, region: Option<String>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No key material returned"))?;
 
-    // Ensure .ssh directory exists
-    let ssh = ssh_dir()?;
-    fs::create_dir_all(&ssh)?;
+    // OpenSSH rejects a key whose final -----END----- line has no newline
+    // after it ("error in libcrypto"), and the XML parser strips the trailing
+    // whitespace off every text node, so what AWS sent arrives one byte short.
+    let mut private_key = private_key.clone();
+    if !private_key.ends_with('\n') {
+        private_key.push('\n');
+    }
 
-    // Write the private key
-    fs::write(&key_path, private_key)?;
-
-    // Set permissions to 600
-    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+    crate::utils::write_secret(&key_path, &private_key)?;
 
     println!("Created key pair: {}", name);
     println!("Private key saved to: {}", key_path.display());

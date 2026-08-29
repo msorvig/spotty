@@ -182,7 +182,7 @@ pub fn load_cached_token(session_name: &str) -> Option<CachedToken> {
 }
 
 fn save_cached_token(session_name: &str, token: &CachedToken) -> Result<()> {
-    write_secret(&token_cache_path(session_name)?, &serde_json::to_string_pretty(token)?)
+    crate::utils::write_secret(&token_cache_path(session_name)?, &serde_json::to_string_pretty(token)?)
 }
 
 // ── Device authorization flow ──────────────────────────────────────────
@@ -394,49 +394,6 @@ pub fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Write a file containing credentials, creating it owner-only.
-///
-/// The mode is set as the file is created rather than afterwards: chmod'ing an
-/// already-written file leaves a window in which it is readable by anyone the
-/// umask allows.
-pub fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
-    use std::io::Write;
-
-    let dir = path.parent().context("credential path has no parent directory")?;
-    fs::create_dir_all(dir)?;
-    restrict_permissions(dir, 0o700)?;
-
-    let mut open = fs::OpenOptions::new();
-    open.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.mode(0o600);
-    }
-
-    let mut file = open
-        .open(path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(contents.as_bytes())?;
-
-    // `mode` above only applies when the file is created, so an existing file
-    // keeps whatever permissions it had.
-    restrict_permissions(path, 0o600)?;
-    Ok(())
-}
-
-/// Restrict a path to its owner.
-fn restrict_permissions(path: &std::path::Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    let _ = (path, mode);
-    Ok(())
 }
 
 fn format_rfc3339(secs: u64) -> String {

@@ -54,3 +54,48 @@ pub fn add_ssh_batch_options(cmd: &mut Command) {
     add_ssh_options(cmd);
     cmd.arg("-o").arg("BatchMode=yes");
 }
+
+/// Write a file containing a secret — a credential cache, an SSH private key —
+/// creating it owner-only.
+///
+/// The mode is set as the file is created rather than afterwards: chmod'ing an
+/// already-written file leaves a window in which it is readable by anyone the
+/// umask allows.
+pub fn write_secret(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+
+    let dir = path.parent().context("secret path has no parent directory")?;
+    std::fs::create_dir_all(dir)?;
+    restrict_permissions(dir, 0o700)?;
+
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+
+    let mut file = open
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+
+    // `mode` above only applies when the file is created, so an existing file
+    // keeps whatever permissions it had.
+    restrict_permissions(path, 0o600)?;
+    Ok(())
+}
+
+/// Restrict a path to its owner.
+fn restrict_permissions(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
