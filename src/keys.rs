@@ -131,17 +131,31 @@ pub async fn remove_key_pair(name: &str, region: Option<String>, force: bool) ->
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))
-    .with_context(|| format!("failed to delete key pair '{name}' in {}", clients.region))?;
+    .with_context(|| {
+        // The scoped role may only delete key pairs named spotty-*, which is
+        // not obvious from a bare AccessDenied.
+        if name.starts_with("spotty") {
+            format!("failed to delete key pair '{name}' in {}", clients.region)
+        } else {
+            format!(
+                "failed to delete key pair '{name}' in {}. The scoped spotty role may only \
+                 delete key pairs named spotty-*; use the AWS console or CLI for others.",
+                clients.region
+            )
+        }
+    })?;
     println!("Deleted key pair '{}' in {}.", name, clients.region);
 
     // DeleteKeyPair succeeds whether or not the key pair existed, so say
     // plainly what happened to the local file rather than implying more.
-    let local = ssh_dir()?.join(format!("{name}.pem"));
-    if local.exists() {
-        std::fs::remove_file(&local)?;
-        println!("Removed {}.", local.display());
-    } else {
-        println!("No local private key at {}.", local.display());
+    // Look for it the same way SSH does, or a key stored under one of the
+    // other accepted names survives while this reports there was none.
+    match crate::ssh::find_key_file(name) {
+        Some(local) => {
+            std::fs::remove_file(&local)?;
+            println!("Removed {local}.");
+        }
+        None => println!("No local private key for '{name}' in {}.", ssh_dir()?.display()),
     }
 
     Ok(())

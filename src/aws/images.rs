@@ -9,7 +9,7 @@ use super::instances::{self, LaunchConfig};
 use crate::config::Config;
 use crate::ec2;
 use crate::ssh;
-use crate::utils::add_ssh_options;
+use crate::utils::{add_identity, add_ssh_options};
 
 #[derive(Debug, Serialize, Tabled)]
 pub struct AmiInfo {
@@ -427,7 +427,7 @@ async fn build_image_inner(
     // SCP upload
     let mut scp_cmd = Command::new("scp");
     if let Some(ref kp) = key_path {
-        scp_cmd.arg("-i").arg(kp);
+        add_identity(&mut scp_cmd, kp);
     }
     add_ssh_options(&mut scp_cmd);
     scp_cmd.arg(script).arg(&target);
@@ -440,7 +440,7 @@ async fn build_image_inner(
     // SSH run script
     let mut ssh_cmd = Command::new("ssh");
     if let Some(ref kp) = key_path {
-        ssh_cmd.arg("-i").arg(kp);
+        add_identity(&mut ssh_cmd, kp);
     }
     add_ssh_options(&mut ssh_cmd);
     ssh_cmd

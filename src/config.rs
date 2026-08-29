@@ -128,17 +128,35 @@ pub fn show_config() -> Result<()> {
 pub fn set_config(key: &str, value: &str) -> Result<()> {
     let mut config = Config::load()?;
 
-    match key {
-        "region" => config.defaults.region = Some(value.to_string()),
-        "key_name" => config.defaults.key_name = Some(value.to_string()),
-        "key_path" => config.defaults.key_path = Some(value.to_string()),
-        "ssh_user" => config.defaults.ssh_user = Some(value.to_string()),
-        "security_group" => config.defaults.security_group = Some(value.to_string()),
-        "role_arn" => config.defaults.role_arn = Some(value.to_string()),
-        "sso_profile" => config.defaults.sso_profile = Some(value.to_string()),
+    // Region-scoped keys have to go in the same `[regions.<r>]` block that
+    // `setup` writes, or they are shadowed by it and setting them does
+    // nothing at all.
+    let region_scoped = matches!(key, "key_name" | "key_path" | "security_group");
+    let target_region = config.defaults.region.clone();
+
+    match (key, region_scoped, target_region.as_deref()) {
+        (_, true, Some(region)) => {
+            let defaults = config.region_defaults_mut(region);
+            match key {
+                "key_name" => defaults.key_name = Some(value.to_string()),
+                "key_path" => defaults.key_path = Some(value.to_string()),
+                _ => defaults.security_group = Some(value.to_string()),
+            }
+            config.save()?;
+            println!("Set {key} = {value} for {region}");
+            return Ok(());
+        }
+        // No region known yet, so `[defaults]` is the only place it can go —
+        // and with no `defaults.region` pinned, it applies everywhere.
+        ("key_name", ..) => config.defaults.key_name = Some(value.to_string()),
+        ("key_path", ..) => config.defaults.key_path = Some(value.to_string()),
+        ("security_group", ..) => config.defaults.security_group = Some(value.to_string()),
+        ("region", ..) => config.defaults.region = Some(value.to_string()),
+        ("ssh_user", ..) => config.defaults.ssh_user = Some(value.to_string()),
+        ("role_arn", ..) => config.defaults.role_arn = Some(value.to_string()),
+        ("sso_profile", ..) => config.defaults.sso_profile = Some(value.to_string()),
         _ => {
-            if key.starts_with("ami.") {
-                let ami_key = key.strip_prefix("ami.").unwrap();
+            if let Some(ami_key) = key.strip_prefix("ami.") {
                 config.ami.insert(ami_key.to_string(), value.to_string());
             } else {
                 anyhow::bail!("Unknown config key: {}", key);

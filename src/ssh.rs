@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::aws::client::AwsClients;
 use crate::aws::instances::{get_instance_public_ip, get_instance_key_name};
 use crate::config::Config;
-use crate::utils::{expand_tilde, add_ssh_options, add_ssh_batch_options};
+use crate::utils::{expand_tilde, add_identity, add_ssh_options, add_ssh_batch_options};
 
 pub async fn ssh_into_instance(
     instance_id: String,
@@ -33,7 +33,7 @@ pub async fn ssh_into_instance(
 
     // Add key if specified
     if let Some(ref kp) = key_path {
-        ssh_cmd.arg("-i").arg(kp);
+        add_identity(&mut ssh_cmd, kp);
     }
 
     // Disable strict host key checking for convenience
@@ -64,10 +64,14 @@ pub async fn ssh_into_instance(
 /// rather than after a minute of dots that suggest the instance is still
 /// booting.
 pub async fn wait_for_ssh(ip: &str, user: &str, key_path: Option<&str>) -> Result<()> {
-    let max_attempts = 30;
+    let max_attempts: u32 = 30;
     let delay = Duration::from_secs(2);
     let mut dotted = false;
     let mut last_error = String::new();
+    // Counted separately from `attempt`: a fresh instance spends its first
+    // probes refusing connections outright, and those say nothing about
+    // whether the key is right.
+    let mut rejections = 0;
 
     for attempt in 1..=max_attempts {
         match ssh_probe(ip, user, key_path) {
@@ -78,7 +82,10 @@ pub async fn wait_for_ssh(ip: &str, user: &str, key_path: Option<&str>) -> Resul
                 return Ok(());
             }
             Err(stderr) => {
-                if let Some(reason) = fatal_ssh_error(&stderr, attempt) {
+                if rejected_us(&stderr) {
+                    rejections += 1;
+                }
+                if let Some(reason) = fatal_ssh_error(&stderr, rejections) {
                     if dotted {
                         eprintln!();
                     }
@@ -111,7 +118,7 @@ fn ssh_probe(ip: &str, user: &str, key_path: Option<&str>) -> Result<(), String>
     let mut cmd = Command::new("ssh");
 
     if let Some(kp) = key_path {
-        cmd.arg("-i").arg(kp);
+        add_identity(&mut cmd, kp);
     }
 
     add_ssh_batch_options(&mut cmd);
@@ -127,14 +134,27 @@ fn ssh_probe(ip: &str, user: &str, key_path: Option<&str>) -> Result<(), String>
     }
 }
 
+/// True when sshd answered and turned us away, rather than not answering.
+fn rejected_us(stderr: &str) -> bool {
+    ["Permission denied", "Too many authentication failures"]
+        .iter()
+        .any(|p| stderr.contains(p))
+}
+
 /// Waiting will not help — the reason to report, or `None` to keep retrying.
 ///
-/// `attempt` matters for one case: cloud-init can install the authorized key
-/// just after sshd starts accepting connections, so a rejected key is only
-/// conclusive once the instance has had a moment to finish.
-fn fatal_ssh_error(stderr: &str, attempt: u32) -> Option<String> {
+/// `rejections` is how many times sshd has actually answered and refused us.
+/// Cloud-init can install the authorized key just after sshd starts accepting
+/// connections, so the first refusal or two are not yet conclusive — but they
+/// only count once the server is answering at all.
+fn fatal_ssh_error(stderr: &str, rejections: u32) -> Option<String> {
+    /// Refusals to tolerate before calling the key wrong.
+    const SETTLING_REJECTIONS: u32 = 3;
+
     // Nothing about the instance can fix these: the key is unreadable, absent,
-    // or the host identity is wrong.
+    // or the host identity is wrong. `-o IdentitiesOnly=yes` on every probe
+    // keeps these matched against our own key rather than some unrelated
+    // default identity in ~/.ssh.
     const ALWAYS: &[&str] = &[
         "error in libcrypto",
         "invalid format",
@@ -146,12 +166,9 @@ fn fatal_ssh_error(stderr: &str, attempt: u32) -> Option<String> {
         "Could not resolve hostname",
         "could not run ssh",
     ];
-    // The server answered and turned us away. Real, but give cloud-init a
-    // few seconds to write authorized_keys before believing it.
-    const ONCE_SETTLED: &[&str] = &["Permission denied", "Too many authentication failures"];
 
     let matched = ALWAYS.iter().any(|p| stderr.contains(p))
-        || (attempt > 3 && ONCE_SETTLED.iter().any(|p| stderr.contains(p)));
+        || (rejections > SETTLING_REJECTIONS && rejected_us(stderr));
 
     matched.then(|| summarize_ssh_error(stderr))
 }
@@ -196,7 +213,7 @@ pub async fn run_command(
 
     let mut ssh_cmd = Command::new("ssh");
     if let Some(ref kp) = key_path {
-        ssh_cmd.arg("-i").arg(kp);
+        add_identity(&mut ssh_cmd, kp);
     }
     add_ssh_options(&mut ssh_cmd);
     ssh_cmd.arg(format!("{}@{}", user, ip)).arg(command);
@@ -233,7 +250,7 @@ pub async fn deploy_to_instance(
     // Ensure remote directory exists
     let mut mkdir_cmd = Command::new("ssh");
     if let Some(ref kp) = key_path {
-        mkdir_cmd.arg("-i").arg(kp);
+        add_identity(&mut mkdir_cmd, kp);
     }
     add_ssh_options(&mut mkdir_cmd);
     mkdir_cmd
@@ -256,7 +273,7 @@ pub async fn deploy_to_instance(
 
         let mut scp_cmd = Command::new("scp");
         if let Some(ref kp) = key_path {
-            scp_cmd.arg("-i").arg(kp);
+            add_identity(&mut scp_cmd, kp);
         }
         add_ssh_options(&mut scp_cmd);
         scp_cmd.arg(local_path).arg(&target);
@@ -274,7 +291,7 @@ pub async fn deploy_to_instance(
         eprintln!("Running: {}", cmd);
         let mut ssh_cmd = Command::new("ssh");
         if let Some(ref kp) = key_path {
-            ssh_cmd.arg("-i").arg(kp);
+            add_identity(&mut ssh_cmd, kp);
         }
         add_ssh_options(&mut ssh_cmd);
         ssh_cmd
@@ -358,3 +375,46 @@ pub fn find_key_file(key_name: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REFUSED: &str = "ssh: connect to host 1.2.3.4 port 22: Connection refused";
+    const DENIED: &str = "user@1.2.3.4: Permission denied (publickey).";
+    const BAD_KEY: &str = "Load key \"/home/u/.ssh/k.pem\": error in libcrypto\n\
+                           user@1.2.3.4: Permission denied (publickey).";
+
+    #[test]
+    fn an_unloadable_key_is_fatal_on_the_first_probe() {
+        // The bug this exists for: waiting 60s on a key OpenSSH cannot parse.
+        assert!(fatal_ssh_error(BAD_KEY, 0).is_some());
+    }
+
+    #[test]
+    fn a_booting_instance_keeps_retrying() {
+        // Connection refused must never be fatal, however many times it lands.
+        assert!(fatal_ssh_error(REFUSED, 0).is_none());
+        assert!(fatal_ssh_error(REFUSED, 99).is_none());
+        assert!(!rejected_us(REFUSED));
+    }
+
+    #[test]
+    fn rejections_are_counted_not_attempts() {
+        // cloud-init may not have written authorized_keys yet, so the first
+        // few refusals are tolerated — but only refusals count towards that,
+        // never the connection failures that precede them.
+        assert!(rejected_us(DENIED));
+        assert!(fatal_ssh_error(DENIED, 1).is_none());
+        assert!(fatal_ssh_error(DENIED, 3).is_none());
+        assert!(fatal_ssh_error(DENIED, 4).is_some());
+    }
+
+    #[test]
+    fn the_summary_leads_with_the_cause() {
+        let s = summarize_ssh_error(BAD_KEY);
+        assert!(s.contains("Permission denied"), "{s}");
+        assert!(s.contains("error in libcrypto"), "{s}");
+        assert_eq!(summarize_ssh_error(""), "no output from ssh");
+    }
+}

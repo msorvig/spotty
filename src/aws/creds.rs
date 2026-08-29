@@ -143,9 +143,7 @@ pub async fn resolve(region: Option<String>, privilege: Privilege) -> Result<Res
     //    back a different account than the one the environment names.
     if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
         let mut creds = Credentials::from_env_vars().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let Some(r) = region.or_else(|| config.defaults.region.clone()) {
-            creds.region = r;
-        }
+        creds.region = resolve_region(region, &config, None);
         return Ok(Resolved { credentials: creds, source: CredentialSource::Environment });
     }
 
@@ -229,18 +227,20 @@ fn cache_key(role_arn: &str, region: &str) -> String {
 
 /// The region to operate in, most specific source first.
 ///
-/// `AWS_REGION`/`AWS_DEFAULT_REGION` sit above the SSO profile's `region` key,
-/// matching the AWS CLI: an exported region is a deliberate act for this shell,
-/// while the profile is a standing default. With nothing else to go on, the
-/// region the SSO session itself lives in beats a hardcoded us-east-1.
+/// The order follows the AWS CLI: an explicit `--region`, then the
+/// environment, then stored configuration. `AWS_REGION` has to outrank
+/// `config.toml`, because `spotty setup` always writes a region there —
+/// leaving it below would make exporting `AWS_REGION` do nothing at all once
+/// setup had run. With nothing else to go on, the region the SSO session
+/// itself lives in beats a hardcoded us-east-1.
 pub fn resolve_region(
     explicit: Option<String>,
     config: &Config,
     sso_config: Option<&sso::SsoConfig>,
 ) -> String {
     explicit
-        .or_else(|| config.defaults.region.clone())
         .or_else(Credentials::region_from_env)
+        .or_else(|| config.defaults.region.clone())
         .or_else(|| sso_config.and_then(|c| c.region.clone()))
         .or_else(|| sso_config.map(|c| c.sso_region.clone()))
         .unwrap_or_else(Credentials::resolve_region)

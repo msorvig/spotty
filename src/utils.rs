@@ -99,3 +99,13 @@ fn restrict_permissions(path: &std::path::Path, mode: u32) -> anyhow::Result<()>
     let _ = (path, mode);
     Ok(())
 }
+
+/// Point ssh/scp at exactly one private key.
+///
+/// `IdentitiesOnly` matters: without it ssh also offers every default identity
+/// in `~/.ssh`, which muddies the error when the intended key is the problem
+/// (a broken `id_rsa` reports the same "Load key" failure) and can exhaust the
+/// server's MaxAuthTries before the right key is ever reached.
+pub fn add_identity(cmd: &mut Command, key_path: &str) {
+    cmd.arg("-i").arg(key_path).arg("-o").arg("IdentitiesOnly=yes");
+}

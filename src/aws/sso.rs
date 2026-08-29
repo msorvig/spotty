@@ -392,7 +392,13 @@ pub async fn login(config: &SsoConfig, browser: BrowserMode) -> Result<CachedTok
             Err(AwsError::AwsService { code, message }) => {
                 bail!("login failed ({code}): {message}");
             }
-            Err(e) => bail!("login failed: {e}"),
+            // A dropped connection or an unreadable body is not the service
+            // saying no. Giving up here would throw away an approval the user
+            // has already given, so keep polling until the code expires.
+            Err(e) => {
+                tracing::debug!("transient error while polling for approval: {e}");
+                continue;
+            }
         }
     }
 }
