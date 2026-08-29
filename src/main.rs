@@ -477,29 +477,11 @@ async fn main() -> Result<()> {
         tracing::debug!("Tracing enabled");
     }
 
-    if let Err(e) = run(cli).await {
-        // Check for AWS credential errors by examining the full error chain
-        let is_credential_error = {
-            // Check Display and Debug output for credential-related keywords
-            let display_str = e.to_string().to_lowercase();
-            let debug_str = format!("{:?}", e).to_lowercase();
-
-            let keywords = ["credentials", "unauthorizedexception", "expiredtoken", "no credentials"];
-            keywords.iter().any(|kw| display_str.contains(kw) || debug_str.contains(kw))
-        };
-
-        if is_credential_error {
-            eprintln!("Error: AWS credentials are missing or expired.\n");
-            eprintln!("If using AWS SSO, run:");
-            eprintln!("  aws sso login --profile <your-profile>\n");
-            eprintln!("Or set AWS_PROFILE if needed:");
-            eprintln!("  export AWS_PROFILE=<your-profile>");
-            std::process::exit(1);
-        }
-        return Err(e);
-    }
-
-    Ok(())
+    // Errors are reported as they come. `creds::resolve` already knows whether
+    // a login is missing and says so, naming the session it wants; matching on
+    // keywords here instead would replace real failures — an AssumeRole that
+    // returned nothing, say — with login advice that does not apply.
+    run(cli).await
 }
 
 async fn run(cli: Cli) -> Result<()> {
