@@ -87,6 +87,67 @@ pub struct LaunchConfig {
     pub no_auto_cleanup: bool,
     pub max_tries: usize,
     pub volume_size: Option<i32>,
+    /// The base image when no `ami` is given: a name from `BASE_OS`
+    /// (default: Amazon Linux 2023).
+    pub os: Option<String>,
+    /// A shutdown from inside the instance terminates it, rather than
+    /// stopping it, so an instance can end itself.
+    pub terminate_on_shutdown: bool,
+}
+
+/// A base image spotty can find by name: its SSM parameter (with `{arch}`
+/// as EC2 names it, `{deb_arch}` as Debian does) and the user it logs in as.
+pub struct BaseOs {
+    pub name: &'static str,
+    pub ssm_param: &'static str,
+    pub ssh_user: &'static str,
+}
+
+pub const BASE_OS: &[BaseOs] = &[
+    BaseOs {
+        name: "al2023",
+        ssm_param: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{arch}",
+        ssh_user: "ec2-user",
+    },
+    BaseOs {
+        name: "ubuntu-24.04",
+        ssm_param: "/aws/service/canonical/ubuntu/server/24.04/stable/current/{deb_arch}/hvm/ebs-gp3/ami-id",
+        ssh_user: "ubuntu",
+    },
+];
+
+pub fn base_os(name: Option<&str>) -> Result<&'static BaseOs> {
+    let name = name.unwrap_or("al2023");
+    BASE_OS.iter().find(|o| o.name == name).ok_or_else(|| {
+        let known: Vec<_> = BASE_OS.iter().map(|o| o.name).collect();
+        anyhow::anyhow!("unknown --os '{}'; known: {}", name, known.join(", "))
+    })
+}
+
+/// The tag that records which user an instance or image logs in as, so
+/// `ssh`, `deploy` and `image build` need not be told.
+pub const SSH_USER_TAG: &str = "SshUser";
+
+/// An image's root device name and the user it logs in as, if tagged.
+async fn describe_ami(clients: &AwsClients, ami_id: &str) -> Result<(Option<String>, Option<String>)> {
+    let resp = ec2::describe_images(
+        &clients.client,
+        ec2::DescribeImagesRequest::default().image_ids(ami_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))
+    .with_context(|| format!("Failed to describe AMI {}", ami_id))?;
+    let image = resp
+        .images
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .ok_or_else(|| anyhow::anyhow!("AMI {} not found", ami_id))?;
+    let user = image
+        .tags
+        .as_ref()
+        .and_then(|l| l.item.iter().find(|t| t.key.as_deref() == Some(SSH_USER_TAG)))
+        .and_then(|t| t.value.clone());
+    Ok((image.root_device_name.clone(), user))
 }
 
 /// Result from launching instances
@@ -168,9 +229,10 @@ async fn launch_instances_impl(
         eprintln!("\nTrying {} @ ${:.4}/hr...", instance_type_str, price);
 
         // Resolve AMI for this instance type
+        let os = base_os(config.os.as_deref())?;
         let ami_id = match &config.ami {
             Some(id) => id.clone(),
-            None => match discover_ami(&clients, instance_type_str).await {
+            None => match discover_ami(&clients, instance_type_str, os).await {
                 Ok(id) => id,
                 Err(e) => {
                     eprintln!("  Failed to discover AMI: {}", e);
@@ -178,6 +240,21 @@ async fn launch_instances_impl(
                     continue;
                 }
             }
+        };
+        // The root device is the image's own: Amazon Linux calls it
+        // /dev/xvda, Ubuntu /dev/sda1, and a mapping for any other name adds
+        // a second, empty volume instead of resizing the root.
+        let (root_device, ami_user) = match describe_ami(&clients, &ami_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  {}", e);
+                last_error = Some(e);
+                continue;
+            }
+        };
+        let ssh_user = match &config.ami {
+            Some(_) => ami_user,
+            None => Some(os.ssh_user.to_string()),
         };
 
         // Build spot options with max price
@@ -190,11 +267,14 @@ async fn launch_instances_impl(
             .market_type(ec2::MarketType::Spot)
             .spot_options(spot_opts);
 
-        let tags = ec2::TagSpecification::default()
+        let mut tags = ec2::TagSpecification::default()
             .resource_type(ec2::ResourceType::Instance)
             .tags(ec2::Tag::default().key("Name").value(instance_name.clone()))
             .tags(ec2::Tag::default().key("ManagedBy").value("spotty"))
             .tags(ec2::Tag::default().key("AutoCleanup").value(auto_cleanup_value));
+        if let Some(ref user) = ssh_user {
+            tags = tags.tags(ec2::Tag::default().key(SSH_USER_TAG).value(user.clone()));
+        }
 
         // Parse instance type
         let it = ec2::InstanceType::from(instance_type_str.as_str());
@@ -214,10 +294,14 @@ async fn launch_instances_impl(
             req = req.user_data(ud.clone());
         }
 
+        if config.terminate_on_shutdown {
+            req = req.instance_initiated_shutdown_behavior(ec2::ShutdownBehavior::Terminate);
+        }
+
         if let Some(size) = config.volume_size {
             req = req.block_device_mappings(
                 ec2::BlockDeviceMapping::default()
-                    .device_name("/dev/xvda")
+                    .device_name(root_device.clone().unwrap_or_else(|| "/dev/xvda".to_string()))
                     .ebs(
                         ec2::EbsBlockDevice::default()
                             .volume_size(size)
@@ -755,7 +839,7 @@ async fn discover_key_pair(clients: &AwsClients) -> Result<String> {
     Ok(keys[0].to_string())
 }
 
-async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<String> {
+async fn discover_ami(clients: &AwsClients, instance_type: &str, os: &BaseOs) -> Result<String> {
     // Get architecture from cached instance type data
     let instance_types = super::filters::get_instance_types(clients).await?;
     let arch = instance_types
@@ -763,11 +847,9 @@ async fn discover_ami(clients: &AwsClients, instance_type: &str) -> Result<Strin
         .and_then(|spec| spec.architectures.first())
         .map(|a| a.as_str())
         .unwrap_or("x86_64");
+    let deb_arch = if arch == "arm64" { "arm64" } else { "amd64" };
 
-    let param_name = format!(
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{}",
-        arch
-    );
+    let param_name = os.ssm_param.replace("{arch}", arch).replace("{deb_arch}", deb_arch);
 
     let resp = crate::ssm::get_parameter(
         &clients.client,
@@ -987,6 +1069,31 @@ pub async fn get_instance_key_name(
         .ok_or_else(|| anyhow::anyhow!("Instance has no key name"))?;
 
     Ok(key_name.to_string())
+}
+
+/// The value of one of the instance's tags, if it has it.
+pub async fn get_instance_tag(
+    clients: &AwsClients,
+    instance_id: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let resp = ec2::describe_instances(
+        &clients.client,
+        ec2::DescribeInstancesRequest::default()
+            .instance_ids(instance_id),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    Ok(resp
+        .reservations
+        .as_ref()
+        .and_then(|l| l.item.first())
+        .and_then(|r| r.instances.as_ref())
+        .and_then(|l| l.item.first())
+        .and_then(|i| i.tags.as_ref())
+        .and_then(|l| l.item.iter().find(|t| t.key.as_deref() == Some(key)))
+        .and_then(|t| t.value.clone()))
 }
 
 fn parse_instance(

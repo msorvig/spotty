@@ -237,6 +237,13 @@ pub async fn create_image(
         .map(|t| t.to_string())
         .unwrap_or_default();
 
+    // An image logs in as the instance it was made from did.
+    let ssh_user = instance
+        .tags
+        .as_ref()
+        .and_then(|l| l.item.iter().find(|t| t.key.as_deref() == Some(instances::SSH_USER_TAG)))
+        .and_then(|t| t.value.clone());
+
     // Detect architecture from instance type
     let instance_types = super::filters::get_instance_types(&clients).await?;
     let arch = instance_types
@@ -256,26 +263,29 @@ pub async fn create_image(
         ami_name, instance_id, arch
     );
 
+    let mut image_tags = ec2::TagSpecification::default()
+        .resource_type(ec2::ResourceType::Image)
+        .tags(
+            ec2::Tag::default()
+                .key("ManagedBy")
+                .value("spotty"),
+        )
+        .tags(
+            ec2::Tag::default()
+                .key("Architecture")
+                .value(arch.clone()),
+        );
+    if let Some(user) = ssh_user {
+        image_tags = image_tags.tags(ec2::Tag::default().key(instances::SSH_USER_TAG).value(user));
+    }
+
     let create_resp = ec2::create_image(
         &clients.client,
         ec2::CreateImageRequest::default()
             .instance_id(instance_id.clone())
             .name(ami_name)
             .no_reboot(no_reboot)
-            .tag_specifications(
-                ec2::TagSpecification::default()
-                    .resource_type(ec2::ResourceType::Image)
-                    .tags(
-                        ec2::Tag::default()
-                            .key("ManagedBy")
-                            .value("spotty"),
-                    )
-                    .tags(
-                        ec2::Tag::default()
-                            .key("Architecture")
-                            .value(arch.clone()),
-                    ),
-            )
+            .tag_specifications(image_tags)
             // The backing snapshots are separate resources: without their own
             // tag the scoped role cannot delete them when the AMI is removed.
             .tag_specifications(
@@ -409,11 +419,8 @@ async fn build_image_inner(
     let ip = instances::get_instance_public_ip(&clients, instance_id).await?;
     let key_path = ssh::resolve_key_path(&clients, &config, instance_id, None).await?;
 
-    let user = config
-        .defaults
-        .ssh_user
-        .as_deref()
-        .unwrap_or("ec2-user");
+    let user = ssh::resolve_user(&clients, &config, instance_id, None).await?;
+    let user = user.as_str();
 
     // Step 2: Wait for SSH
     eprintln!("Step 2/5: Waiting for SSH...");
@@ -445,7 +452,9 @@ async fn build_image_inner(
     add_ssh_options(&mut ssh_cmd);
     ssh_cmd
         .arg(format!("{}@{}", user, ip))
-        .arg("chmod +x /tmp/spotty-build.sh && /tmp/spotty-build.sh");
+        // The image is taken without a reboot, so whatever the script wrote
+        // that is still in the page cache would be missing from it: sync.
+        .arg("chmod +x /tmp/spotty-build.sh && /tmp/spotty-build.sh && sync");
 
     let ssh_status = ssh_cmd.status().context("Failed to run ssh")?;
     if !ssh_status.success() {

@@ -94,9 +94,17 @@ enum Commands {
         #[command(flatten)]
         filter: InstanceFilterArgs,
 
-        /// AMI ID (default: latest Amazon Linux 2023)
-        #[arg(long)]
+        /// AMI ID (default: the latest image of --os)
+        #[arg(long, conflicts_with = "os")]
         ami: Option<String>,
+
+        /// Base image when no --ami is given: al2023 (default) or ubuntu-24.04
+        #[arg(long)]
+        os: Option<String>,
+
+        /// A shutdown from inside the instance terminates it
+        #[arg(long)]
+        terminate_on_shutdown: bool,
 
         /// AWS region
         #[arg(long, short)]
@@ -187,9 +195,9 @@ enum Commands {
         #[arg(long, short)]
         key: Option<String>,
 
-        /// SSH user (default: ec2-user)
-        #[arg(long, short, default_value = "ec2-user")]
-        user: String,
+        /// SSH user (default: the one the instance was launched for)
+        #[arg(long, short)]
+        user: Option<String>,
 
         /// Run command instead of interactive shell
         #[arg(long, short)]
@@ -226,9 +234,9 @@ enum Commands {
         #[arg(long, short)]
         key: Option<String>,
 
-        /// SSH user
-        #[arg(long, short, default_value = "ec2-user")]
-        user: String,
+        /// SSH user (default: the one the instance was launched for)
+        #[arg(long, short)]
+        user: Option<String>,
 
         /// AWS region
         #[arg(long)]
@@ -372,6 +380,10 @@ enum ImageAction {
         /// Root volume size in GB (default: 20)
         #[arg(long)]
         volume_size: Option<i32>,
+
+        /// Base image to start from: al2023 (default) or ubuntu-24.04
+        #[arg(long)]
+        os: Option<String>,
 
         /// AWS region
         #[arg(long, short)]
@@ -564,6 +576,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Start {
             filter,
             ami,
+            os,
+            terminate_on_shutdown,
             region,
             key_name,
             security_group,
@@ -601,6 +615,8 @@ async fn run(cli: Cli) -> Result<()> {
                 no_auto_cleanup,
                 max_tries,
                 volume_size,
+                os,
+                terminate_on_shutdown,
             };
             let infos = aws::instances::start_instances(config, number, wait).await?;
             if json {
@@ -817,6 +833,7 @@ async fn run(cli: Cli) -> Result<()> {
                 filter,
                 name,
                 volume_size,
+                os,
                 region,
             } => {
                 let arch = filter.arch_str().map(String::from);
@@ -831,6 +848,7 @@ async fn run(cli: Cli) -> Result<()> {
                     volume_size,
                     no_auto_cleanup: true, // don't auto-cleanup builder instances
                     max_tries: 10,
+                    os,
                     ..Default::default()
                 };
                 aws::images::build_image(script, name, volume_size, region, launch_config).await?;

@@ -295,7 +295,24 @@ spotty start --instance-type t3.large --ami ami-0123456789abcdef0 --key-name my-
 
 # Custom root volume size
 spotty start --instance-type t3.medium --volume-size 50
+
+# Ubuntu 24.04 instead of Amazon Linux 2023
+spotty start --os ubuntu-24.04 --vcpu-min 2
+
+# Terminate (not stop) when the instance shuts itself down
+spotty start --os ubuntu-24.04 --terminate-on-shutdown --vcpu-min 2
 ```
+
+`--os` picks the base image: `al2023` (the default) or `ubuntu-24.04`. Each
+logs in as a different user (`ec2-user`, `ubuntu`), so spotty tags the
+instance with `SshUser` at launch, and `ssh`, `deploy` and `image build` log
+in as that user unless `--user` says otherwise. An AMI made with `spotty
+image create` or `image build` carries the tag of the instance it was made
+from, and instances launched from it inherit it.
+
+`--terminate-on-shutdown` makes a `shutdown` from inside the instance
+terminate it. A job can then end its own instance, and a `shutdown -h +N`
+at boot is a deadline that holds even when nobody runs `spotty stop`.
 
 ### 4. Check Status
 
@@ -384,6 +401,9 @@ spotty image build --script setup.sh --arch arm64
 
 # With a custom name and volume size
 spotty image build --script setup.sh --name "my-app-v1" --volume-size 40
+
+# From Ubuntu 24.04
+spotty image build --script setup.sh --os ubuntu-24.04
 ```
 
 ### Build a Custom AMI with a Deployed Binary

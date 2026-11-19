@@ -4,14 +4,31 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::aws::client::AwsClients;
-use crate::aws::instances::{get_instance_public_ip, get_instance_key_name};
+use crate::aws::instances::{get_instance_public_ip, get_instance_key_name, get_instance_tag, SSH_USER_TAG};
 use crate::config::Config;
 use crate::utils::{expand_tilde, add_identity, add_ssh_options, add_ssh_batch_options};
+
+/// The user to log in to `instance_id` as: the one asked for, else the one
+/// the instance was tagged with at launch (its image's), else the config's.
+pub async fn resolve_user(
+    clients: &AwsClients,
+    config: &Config,
+    instance_id: &str,
+    explicit: Option<String>,
+) -> Result<String> {
+    if let Some(u) = explicit {
+        return Ok(u);
+    }
+    if let Some(u) = get_instance_tag(clients, instance_id, SSH_USER_TAG).await? {
+        return Ok(u);
+    }
+    Ok(config.defaults.ssh_user.clone().unwrap_or_else(|| "ec2-user".to_string()))
+}
 
 pub async fn ssh_into_instance(
     instance_id: String,
     key: Option<String>,
-    user: String,
+    user: Option<String>,
     command: Option<String>,
     region: Option<String>,
 ) -> Result<()> {
@@ -22,6 +39,7 @@ pub async fn ssh_into_instance(
     let ip = get_instance_public_ip(&clients, &instance_id).await?;
 
     let key_path = resolve_key_path(&clients, &config, &instance_id, key).await?;
+    let user = resolve_user(&clients, &config, &instance_id, user).await?;
 
     eprintln!("Connecting to {} ({})...", instance_id, ip);
 
@@ -207,7 +225,8 @@ pub async fn run_command(
 
     let key_path = resolve_key_path(&clients, &config, instance_id, None).await?;
 
-    let user = config.defaults.ssh_user.as_deref().unwrap_or("ec2-user");
+    let user = resolve_user(&clients, &config, instance_id, None).await?;
+    let user = user.as_str();
 
     wait_for_ssh(&ip, user, key_path.as_deref()).await?;
 
@@ -233,7 +252,7 @@ pub async fn deploy_to_instance(
     local_paths: Vec<String>,
     remote_dir: String,
     key: Option<String>,
-    user: String,
+    user: Option<String>,
     command: Option<String>,
     region: Option<String>,
 ) -> Result<()> {
@@ -243,6 +262,7 @@ pub async fn deploy_to_instance(
     let ip = get_instance_public_ip(&clients, &instance_id).await?;
 
     let key_path = resolve_key_path(&clients, &config, &instance_id, key).await?;
+    let user = resolve_user(&clients, &config, &instance_id, user).await?;
 
     // Wait for SSH to be ready
     wait_for_ssh(&ip, &user, key_path.as_deref()).await?;
